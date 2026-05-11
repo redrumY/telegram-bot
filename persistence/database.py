@@ -1,0 +1,72 @@
+import sqlite3
+import threading
+from pathlib import Path
+from typing import Final
+
+import sqlite_vec
+
+from config.settings import settings
+
+# Ensure each thread has its own connection
+_local: threading.local = None
+_lock: threading.Lock = threading.Lock()
+
+TABLE_SCHEMA: Final = """
+-- Core memory storage
+CREATE TABLE IF NOT EXISTS memory_items (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    memory_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    embedding BLOB,
+    status TEXT NOT NULL DEFAULT 'active',
+    source_ref TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Vector index for similarity search (sqlite-vec virtual table)
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
+    embedding_id TEXT PRIMARY KEY,
+    embedding FLOAT[1024]
+);
+
+-- Memory replacement tracking
+CREATE TABLE IF NOT EXISTS memory_replacements (
+    old_id TEXT NOT NULL,
+    new_id TEXT NOT NULL,
+    replaced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (old_id, new_id)
+);
+"""
+
+
+def init_db() -> None:
+    """Initialize database with schema."""
+    db_path = Path(settings.DATABASE_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(db_path))
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    conn.executescript(TABLE_SCHEMA)
+    conn.commit()
+    conn.close()
+
+
+def get_connection() -> sqlite3.Connection:
+    """Get thread-local database connection with vec extension loaded."""
+    global _local
+    if _local is None:
+        _local = threading.local()
+
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        with _lock:
+            conn = sqlite3.connect(settings.DATABASE_PATH)
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+            _local.conn = conn
+    return conn
