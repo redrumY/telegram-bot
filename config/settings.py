@@ -20,5 +20,8 @@ class Settings(BaseSettings):
     # Database
     DATABASE_PATH: str = "./data/memory.db"
 
+    # Proxy (for Telegram API in China)
+    HTTP_PROXY: str | None = None
+
 
 settings = Settings()

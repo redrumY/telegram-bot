@@ -39,6 +39,7 @@ class Session:
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
+    last_consolidated: int = 0  # 对齐 akashic session.last_consolidated
 
 
 @dataclass
@@ -78,6 +79,7 @@ class AfterReasoningCtx(PipelineContext):
 class TurnCommittedEvent:
     turn_id: str
     user_id: int
+    inbound_content: str
     outbound_message: OutboundMessage
     new_memory_ids: list[UUID]
     timestamp: datetime = field(default_factory=datetime.utcnow)

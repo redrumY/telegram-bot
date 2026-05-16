@@ -38,6 +38,16 @@ CREATE TABLE IF NOT EXISTS memory_replacements (
     replaced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (old_id, new_id)
 );
+
+-- Session persistence (对齐 akashic sessions.db)
+CREATE TABLE IF NOT EXISTS conversation_sessions (
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    messages_json TEXT NOT NULL DEFAULT '[]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, chat_id)
+);
 """
 
 

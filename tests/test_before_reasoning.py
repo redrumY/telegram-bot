@@ -85,9 +85,11 @@ async def test_build_ctx_with_memories():
     assert reasoning_ctx.messages[-1]["content"] == "我喜欢什么水果？"
 
     # Verify tools are included
-    assert len(reasoning_ctx.tools) == 1
-    assert reasoning_ctx.tools[0]["type"] == "function"
-    assert reasoning_ctx.tools[0]["function"]["name"] == "memorize"
+    assert len(reasoning_ctx.tools) >= 1
+    tool_names = [t["function"]["name"] for t in reasoning_ctx.tools]
+    assert "memorize" in tool_names
+    assert "recall_memory" in tool_names
+    assert "search_messages" in tool_names
 
     print(f"System prompt:\n{system_prompt}")
     print("test_build_ctx_with_memories: PASS")
@@ -116,6 +118,49 @@ async def test_build_ctx_no_memories():
     assert reasoning_ctx.messages[-1]["content"] == "你好"
 
     print("test_build_ctx_no_memories: PASS")
+
+
+async def test_benchmark_prompt_requires_memory_tools():
+    """Test benchmark mode adds Akashic-style mandatory memory instructions."""
+    phase = BeforeReasoningPhase(benchmark_mode=True)
+
+    session = Session(user_id=123, chat_id=456, messages=[])
+    inbound = InboundMessage(user_id=123, chat_id=456, content="我是什么职业？")
+    turn_ctx = BeforeTurnCtx(
+        inbound_message=inbound,
+        session=session,
+        retrieved_memories=[],
+    )
+
+    reasoning_ctx = await phase.build_ctx(turn_ctx)
+    system_prompt = reasoning_ctx.messages[0]["content"]
+
+    assert "Benchmark Mode" in system_prompt
+    assert "必须先调用 recall_memory" in system_prompt
+    assert "必须继续调用 search_messages" in system_prompt
+    assert "必须先调用 fetch_messages" in system_prompt
+    assert "recall_memory 返回的是摘要线索，不是原文证据" in system_prompt
+    assert "禁止只凭 recall 摘要或 search 预览直接作答" in system_prompt
+
+    recall_tool = next(
+        t for t in reasoning_ctx.tools
+        if t["function"]["name"] == "recall_memory"
+    )
+    assert "不是原文证据" in recall_tool["function"]["description"]
+    memory_types = recall_tool["function"]["parameters"]["properties"]["memory_type"]["enum"]
+    assert "profile" in memory_types
+    assert "procedure" in memory_types
+
+    fetch_tool = next(
+        t for t in reasoning_ctx.tools
+        if t["function"]["name"] == "fetch_messages"
+    )
+    fetch_desc = fetch_tool["function"]["description"]
+    assert "唯一可以直接作为最终证据的工具" in fetch_desc
+    assert "不要猜" in fetch_desc
+    assert "source_refs" in fetch_tool["function"]["parameters"]["properties"]
+
+    print("test_benchmark_prompt_requires_memory_tools: PASS")
 
 
 async def test_messages_format_openai():
@@ -153,6 +198,7 @@ async def main():
     await test_preheat()
     await test_build_ctx_with_memories()
     await test_build_ctx_no_memories()
+    await test_benchmark_prompt_requires_memory_tools()
     await test_messages_format_openai()
     print("\nAll before_reasoning tests passed!")
 

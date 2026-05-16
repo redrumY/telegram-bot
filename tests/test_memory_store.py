@@ -100,6 +100,16 @@ async def test_supersede():
         assert mem1.id not in result_ids
         assert mem2.id not in result_ids
 
+        history_results = await store.vector_search(
+            query_vec=[0.5] * 1024,
+            user_id=user_id,
+            top_k=10,
+            include_superseded=True,
+        )
+        history_ids = [r.id for r in history_results]
+        assert mem1.id in history_ids
+        assert mem2.id in history_ids
+
         print("test_supersede: PASS")
 
 

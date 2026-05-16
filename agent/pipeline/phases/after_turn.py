@@ -27,6 +27,7 @@ class AfterTurnPhase:
         ctx: AfterReasoningCtx,
         user_id: int,
         new_memory_ids: list[UUID],
+        inbound_content: str = "",
     ) -> None:
         """Execute post-turn operations."""
         # Generate turn ID
@@ -36,11 +37,13 @@ class AfterTurnPhase:
         event = TurnCommittedEvent(
             turn_id=turn_id,
             user_id=user_id,
+            inbound_content=inbound_content,
             outbound_message=ctx.outbound_message,
             new_memory_ids=new_memory_ids,
         )
 
         await self.event_bus.emit("turn_committed", event=event)
 
-        # Send message via Telegram
-        await self.telegram_adapter.send(ctx.outbound_message)
+        # Send message via Telegram (skip if no adapter, e.g. during testing)
+        if self.telegram_adapter is not None:
+            await self.telegram_adapter.send(ctx.outbound_message)

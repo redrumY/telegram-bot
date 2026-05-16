@@ -124,7 +124,7 @@ async def test_end_to_end_pipeline():
         event = emitted_events[0]
         assert event.user_id == 999
         assert event.outbound_message.content == "Hello, I remember you."
-        assert len(event.new_memory_ids) >= 2  # At least user + assistant messages
+        # persist_messages 已改为异步，new_memory_ids 不再同步返回
 
         print("test_end_to_end_pipeline: PASS")
 

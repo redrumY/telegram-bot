@@ -10,6 +10,7 @@ class Embedder:
         self.client = AsyncOpenAI(
             api_key=settings.ALIYUN_DASHSCOPE_API_KEY,
             base_url=settings.EMBEDDING_BASE_URL,
+            timeout=30.0,
         )
         self.model = settings.EMBEDDING_MODEL
 

@@ -1,7 +1,9 @@
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 from telegram import Update
+from telegram.error import TimedOut, NetworkError, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -21,9 +23,15 @@ logger = logging.getLogger(__name__)
 class TelegramAdapter:
     """Telegram bot adapter using python-telegram-bot."""
 
-    def __init__(self, token: str, pipeline: "PassiveTurnPipeline") -> None:
+    def __init__(
+        self,
+        token: str,
+        pipeline: "PassiveTurnPipeline",
+        proxy: str | None = None,
+    ) -> None:
         self.token = token
         self.pipeline = pipeline
+        self.proxy = proxy
         self.application: Application | None = None
 
     async def _handle_message(
@@ -74,20 +82,57 @@ class TelegramAdapter:
             )
 
     async def send(self, message) -> None:
-        """Send message via Telegram (called by AfterTurnPhase)."""
-        if self.application:
-            await self.application.bot.send_message(
-                chat_id=message.chat_id,
-                text=message.content,
-            )
+        """Send message via Telegram (called by AfterTurnPhase). Retries on network errors."""
+        if not self.application:
+            logger.error("send() called but application is None — message dropped")
+            return
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await self.application.bot.send_message(
+                    chat_id=message.chat_id,
+                    text=message.content,
+                )
+                return
+            except RetryAfter as e:
+                delay = float(getattr(e, "retry_after", 1.0) or 1.0) + 1.0
+                logger.warning(
+                    "send_message rate limited, retry %d/%d in %.1fs",
+                    attempt + 1, max_retries, delay,
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay)
+            except (TimedOut, NetworkError) as e:
+                delay = 2 ** attempt  # 1s, 2s, 4s
+                logger.warning(
+                    "send_message failed (%s), retry %d/%d in %.1fs  chat_id=%s",
+                    type(e).__name__, attempt + 1, max_retries, delay, message.chat_id,
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay)
+        logger.error(
+            "send_message FAILED after %d attempts  chat_id=%s  text=%.100s",
+            max_retries, message.chat_id, message.content,
+        )
 
     async def start(self) -> None:
         """Start the bot with polling."""
-        self.application = (
-            Application.builder()
-            .token(self.token)
-            .build()
-        )
+        if self.proxy:
+            from telegram.request import HTTPXRequest
+
+            request = HTTPXRequest(
+                proxy=self.proxy,
+                connect_timeout=30.0,
+                read_timeout=60.0,
+                write_timeout=30.0,
+                connection_pool_size=8,
+                pool_timeout=10.0,
+            )
+            self.application = Application.builder().token(self.token).request(request).build()
+            logger.info(f"Using proxy: {self.proxy}")
+        else:
+            self.application = Application.builder().token(self.token).build()
 
         # Register handlers
         self.application.add_handler(CommandHandler("start", self._start_command))

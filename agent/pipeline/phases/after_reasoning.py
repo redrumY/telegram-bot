@@ -5,7 +5,6 @@ from agent.core.types import (
     ReasonerResult,
     Session,
 )
-from agent.pipeline.phases.before_turn import _sessions
 from memory.store import MemoryStore
 from uuid import uuid4
 from datetime import datetime
@@ -46,26 +45,7 @@ class AfterReasoningPhase:
         user_message: str,
         assistant_message: str,
         user_id: int,
+        chat_id: int,
     ) -> list[MemoryItem]:
-        """Persist user and assistant messages to memory."""
-        memory_ids = []
-
-        # Persist user message
-        user_memory = await self.store.upsert_item(
-            memory_type="user_message",
-            summary=user_message[:500],  # Truncate if too long
-            user_id=user_id,
-            source_ref="chat",
-        )
-        memory_ids.append(user_memory)
-
-        # Persist assistant message
-        assistant_memory = await self.store.upsert_item(
-            memory_type="assistant_message",
-            summary=assistant_message[:500],
-            user_id=user_id,
-            source_ref="chat",
-        )
-        memory_ids.append(assistant_memory)
-
-        return memory_ids
+        """Raw turns are persisted by SessionStore, not the long-term vector pool."""
+        return []

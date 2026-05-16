@@ -70,7 +70,7 @@ async def test_after_reasoning_build_ctx():
 
 
 async def test_after_reasoning_persist():
-    """Test AfterReasoningPhase persists messages."""
+    """Test raw messages are not written into the long-term vector pool."""
     init_db()
     user_id = 789
 
@@ -83,13 +83,10 @@ async def test_after_reasoning_persist():
             user_message="你好",
             assistant_message="你好！有什么我可以帮你的吗？",
             user_id=user_id,
+            chat_id=1,
         )
 
-        assert len(memories) == 2
-        assert memories[0].memory_type == "user_message"
-        assert memories[1].memory_type == "assistant_message"
-        assert "你好" in memories[0].summary
-        assert "可以帮你的" in memories[1].summary
+        assert memories == []
         print("test_after_reasoning_persist: PASS")
 
 
