@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
+import logging
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -37,8 +40,13 @@ from agent.pipeline.phases.after_turn import AfterTurnPhase
 from agent.pipeline.phases.before_reasoning import BeforeReasoningPhase
 from agent.pipeline.phases.before_turn import BeforeTurnPhase, _sessions
 from agent.pipeline.reasoner import Reasoner
+from agent.plugins import PluginManager
+from agent.tool_hooks import ToolExecutor
+from agent.tools import ToolRegistry
+from agent.tools.memory import register_memory_tools
 from evaluation.dataset_builder import EvalCase, EvalDataset, QuestionType
 from evaluation.metrics import evaluate_single, format_score_report, score_results
+from memory.bootstrap import build_memory_runtime, default_markdown_memory_root
 from memory.embedder import Embedder
 from memory.store import MemoryStore
 from persistence.database import get_connection, init_db
@@ -47,9 +55,12 @@ from persistence.session_store import get_session_store
 _DEFAULT_TIMEOUT_S = 90.0
 _EVAL_USER_ID = 9000
 _EVAL_CHAT_ID = 9000
+_EVAL_QA_CHAT_ID = 9001
 _REPLAY_CONVERSATIONS_PATH = (
     Path(__file__).parent.parent / "data" / "evaluation" / "mock_conversations.jsonl"
 )
+_EVAL_SOURCE_REF = f"session:{_EVAL_USER_ID}:{_EVAL_CHAT_ID}"
+logger = logging.getLogger(__name__)
 
 
 class EvalAdapter:
@@ -60,18 +71,92 @@ class EvalAdapter:
         self.sent_messages.append(message)
 
 
+async def _close_async_resource(resource: object | None) -> None:
+    if resource is None:
+        return
+    close = getattr(resource, "close", None) or getattr(resource, "aclose", None)
+    if close is None:
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:
+        logger.warning("close failed: %s", exc)
+
+
+async def _close_pipeline(pipeline: PassiveTurnPipeline) -> None:
+    plugin_manager = getattr(pipeline, "plugin_manager", None)
+    if plugin_manager is not None:
+        await plugin_manager.terminate_all()
+    await _close_async_resource(getattr(pipeline, "reasoner", None))
+
+
 async def _create_pipeline(
     *,
     store: MemoryStore,
     embedder: Embedder,
 ) -> PassiveTurnPipeline:
-    before_turn = BeforeTurnPhase(embedder, store)
-    before_reasoning = BeforeReasoningPhase(benchmark_mode=True)
+    # Use the same passive-chain wiring shape as main.py, but keep eval-local
+    # runtime objects so per-case --fresh isolation is not polluted by previous
+    # plugin handlers or TAP observers.
+    event_bus = EventBus()
+    tool_registry = ToolRegistry()
+    tool_executor = ToolExecutor()
+    session_store = get_session_store()
+    memory_runtime = build_memory_runtime(
+        embedder=embedder,
+        memory_store=store,
+        session_store=session_store,
+    )
+    reasoner = Reasoner(
+        tool_registry=tool_registry,
+        tool_executor=tool_executor,
+        event_bus=event_bus,
+    )
+    register_memory_tools(tool_registry, memory_runtime.engine)
+
+    plugin_manager = PluginManager(
+        [Path.cwd() / "plugins"],
+        event_bus=event_bus,
+        tool_registry=tool_registry,
+        workspace=Path.cwd(),
+        memory_engine=memory_runtime.engine,
+    )
+    await plugin_manager.load_all()
+    tool_executor.add_hooks(plugin_manager.tool_hooks)
+    reasoner.set_step_modules(
+        before_step=plugin_manager.before_step_modules,
+        after_step=plugin_manager.after_step_modules,
+    )
+
+    before_turn = BeforeTurnPhase(
+        event_bus=event_bus,
+        plugin_modules=plugin_manager.before_turn_modules,
+        memory_engine=memory_runtime.engine,
+    )
+    before_reasoning = BeforeReasoningPhase(
+        benchmark_mode=True,
+        tool_registry=tool_registry,
+        event_bus=event_bus,
+        plugin_modules=plugin_manager.before_reasoning_modules,
+        prompt_render_modules=plugin_manager.prompt_render_modules,
+        self_model_reader=memory_runtime.markdown.store.read_self,
+        long_term_memory_reader=memory_runtime.markdown.store.read_long_term,
+        recent_context_reader=memory_runtime.markdown.store.read_recent_context,
+    )
     await before_reasoning.preheat()
-    reasoner = Reasoner(store=store, embedder=embedder, session_store=get_session_store())
-    after_reasoning = AfterReasoningPhase(store)
-    after_turn = AfterTurnPhase(EventBus.get_instance(), EvalAdapter())
-    return PassiveTurnPipeline(
+    after_reasoning = AfterReasoningPhase(
+        store,
+        event_bus=event_bus,
+        plugin_modules=plugin_manager.after_reasoning_modules,
+    )
+    after_turn = AfterTurnPhase(
+        event_bus,
+        EvalAdapter(),
+        plugin_modules=plugin_manager.after_turn_modules,
+    )
+    pipeline = PassiveTurnPipeline(
         before_turn=before_turn,
         before_reasoning=before_reasoning,
         reasoner=reasoner,
@@ -80,7 +165,10 @@ async def _create_pipeline(
         store=store,
         consolidation_worker=None,
         invalidation_worker=None,
+        memory_runtime=memory_runtime,
     )
+    pipeline.plugin_manager = plugin_manager  # type: ignore[attr-defined]
+    return pipeline
 
 
 def _load_replay_conversations(path: Path = _REPLAY_CONVERSATIONS_PATH) -> list[dict[str, Any]]:
@@ -110,10 +198,19 @@ def _clear_eval_state() -> None:
     conn.execute("DELETE FROM conversation_sessions")
     conn.commit()
     _sessions.clear()
+    shutil.rmtree(
+        default_markdown_memory_root() / "users" / str(_EVAL_USER_ID),
+        ignore_errors=True,
+    )
 
 
 def _save_session(session: Session) -> None:
-    get_session_store().save(session.user_id, session.chat_id, session.messages)
+    get_session_store().save(
+        session.user_id,
+        session.chat_id,
+        session.messages,
+        last_consolidated=session.last_consolidated,
+    )
     _sessions[(session.user_id, session.chat_id)] = session
 
 
@@ -163,48 +260,68 @@ async def _replay_haystack(
     consolidation = ConsolidationWorker(keep_count=0, min_new_messages=1)
     invalidation = InvalidationWorker(store, embedder) if use_invalidation else None
 
-    selected, selection_mode = _select_haystack(case, conversations)
-    n_consolidated = 0
-    n_invalidated = 0
+    try:
+        selected, selection_mode = _select_haystack(case, conversations)
+        n_consolidated = 0
+        n_invalidated = 0
 
-    for idx, conv in enumerate(selected):
-        messages = list(conv.get("messages") or [])
-        session.messages.extend(messages)
-        _save_session(session)
+        for idx, conv in enumerate(selected):
+            messages = list(conv.get("messages") or [])
+            window_start = len(session.messages)
+            session.messages.extend(messages)
+            current_source_ref = _source_ref_for_window(
+                user_id=_EVAL_USER_ID,
+                chat_id=_EVAL_CHAT_ID,
+                start=window_start,
+                end=len(session.messages) - 1,
+            )
+            _save_session(session)
 
-        n_consolidated += await consolidation.consolidate(
-            session, store, _EVAL_USER_ID, _EVAL_CHAT_ID,
-        )
-        _save_session(session)
+            n_consolidated += await consolidation.consolidate(
+                session, store, _EVAL_USER_ID, _EVAL_CHAT_ID,
+            )
+            _save_session(session)
 
-        if invalidation is not None:
-            user_msg, assistant_msg = _last_dialogue_pair(messages)
-            if user_msg:
-                superseded = await invalidation.run(
-                    user_msg=user_msg,
-                    agent_response=assistant_msg,
-                    tool_calls=[],
-                    user_id=_EVAL_USER_ID,
-                    chat_id=_EVAL_CHAT_ID,
-                    source_ref=f"session:{_EVAL_USER_ID}:{_EVAL_CHAT_ID}#post:{idx}",
-                )
-                n_invalidated += len(superseded)
+            if invalidation is not None:
+                user_msg, assistant_msg = _last_dialogue_pair(messages)
+                if user_msg:
+                    superseded = await invalidation.run(
+                        user_msg=user_msg,
+                        agent_response=assistant_msg,
+                        tool_calls=[],
+                        user_id=_EVAL_USER_ID,
+                        chat_id=_EVAL_CHAT_ID,
+                        source_ref=current_source_ref,
+                    )
+                    n_invalidated += len(superseded)
 
-    n_consolidated += await _finalize_tail(session, store)
-    return {
-        "selection_mode": selection_mode,
-        "replayed_sessions": len(selected),
-        "replayed_messages": len(session.messages),
-        "consolidated_memories": n_consolidated,
-        "invalidated_memories": n_invalidated,
-        "last_consolidated": session.last_consolidated,
-    }
+        n_consolidated += await _finalize_tail(session, store)
+        return {
+            "selection_mode": selection_mode,
+            "replayed_sessions": len(selected),
+            "replayed_messages": len(session.messages),
+            "consolidated_memories": n_consolidated,
+            "invalidated_memories": n_invalidated,
+            "last_consolidated": session.last_consolidated,
+        }
+    finally:
+        await _close_async_resource(invalidation)
+
+
+def _source_ref_for_window(*, user_id: int, chat_id: int, start: int, end: int) -> str:
+    if end < start:
+        return f"session:{user_id}:{chat_id}"
+    if start == end:
+        return f"session:{user_id}:{chat_id}#msg:{start}"
+    return f"session:{user_id}:{chat_id}#msg:{start}-{end}"
+
 
 
 async def _run_qa(
     pipeline: PassiveTurnPipeline,
     case: EvalCase,
     *,
+    qa_chat_id: int,
     timeout_s: float,
     trace: bool,
 ) -> dict[str, Any]:
@@ -216,7 +333,7 @@ async def _run_qa(
             pipeline.execute(
                 InboundMessage(
                     user_id=_EVAL_USER_ID,
-                    chat_id=_EVAL_CHAT_ID,
+                    chat_id=qa_chat_id,
                     content=case.question,
                 )
             ),
@@ -244,6 +361,8 @@ async def _run_qa(
         "judge_correct": eval_result.get("rule_judge_correct"),
         "elapsed_s": round(time.monotonic() - t0, 2),
         "error": error,
+        "qa_chat_id": qa_chat_id,
+        "qa_session_isolated": qa_chat_id != _EVAL_CHAT_ID,
     }
     if trace:
         result["retrieval_trace"] = [
@@ -255,6 +374,8 @@ async def _run_qa(
             }
             for m in pipeline.before_turn.last_retrieved
         ]
+        result["retrieval_trace_raw"] = dict(pipeline.before_turn.last_retrieval_trace)
+        result["retrieved_memory_block"] = pipeline.before_turn.last_retrieved_memory_block
         reasoner_result = getattr(pipeline, "last_reasoner_result", None)
         if reasoner_result is not None:
             result["tool_calls"] = reasoner_result.tool_calls
@@ -342,10 +463,32 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=_DEFAULT_TIMEOUT_S)
     parser.add_argument("--compare", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--same-session-qa",
+        action="store_true",
+        help=(
+            "Ask QA in the same chat as haystack replay. Default is isolated QA "
+            "chat_id=9001 to evaluate long-memory retrieval without recent-context leakage."
+        ),
+    )
     return parser
 
 
+def _validate_eval_args(args: argparse.Namespace) -> None:
+    """Enforce AGENTS.md eval invariants before any stateful work starts."""
+    if not args.fresh:
+        raise SystemExit(
+            "replay eval requires --fresh; AGENTS.md requires clearing DB state for every eval run"
+        )
+    if args.no_invalidation:
+        raise SystemExit(
+            "replay eval must include invalidation; baseline flow is haystack replay -> "
+            "consolidation -> invalidation -> PassiveTurnPipeline QA"
+        )
+
+
 async def _main(args: argparse.Namespace) -> None:
+    _validate_eval_args(args)
     init_db()
     conversations = _load_replay_conversations()
     cases = _load_cases(args)
@@ -357,6 +500,15 @@ async def _main(args: argparse.Namespace) -> None:
         f"\nReplay Eval — LIVE | {args.set.upper()} | {len(cases)} cases"
     )
     print("Mode: haystack replay -> consolidation -> invalidation -> QA")
+    qa_chat_id = _EVAL_CHAT_ID if args.same_session_qa else _EVAL_QA_CHAT_ID
+    print(
+        "QA session: "
+        + (
+            f"same chat_id={qa_chat_id}"
+            if args.same_session_qa
+            else f"isolated chat_id={qa_chat_id} (haystack chat_id={_EVAL_CHAT_ID})"
+        )
+    )
 
     results: list[dict[str, Any]] = []
     t0 = time.monotonic()
@@ -364,15 +516,27 @@ async def _main(args: argparse.Namespace) -> None:
         _clear_eval_state()
         embedder = Embedder()
         store = MemoryStore(embedder)
-        ingest_info = await _replay_haystack(
-            case=case,
-            conversations=conversations,
-            store=store,
-            embedder=embedder,
-            use_invalidation=not args.no_invalidation,
-        )
-        pipeline = await _create_pipeline(store=store, embedder=embedder)
-        result = await _run_qa(pipeline, case, timeout_s=args.timeout, trace=args.trace)
+        try:
+            ingest_info = await _replay_haystack(
+                case=case,
+                conversations=conversations,
+                store=store,
+                embedder=embedder,
+                use_invalidation=not args.no_invalidation,
+            )
+            pipeline = await _create_pipeline(store=store, embedder=embedder)
+            try:
+                result = await _run_qa(
+                    pipeline,
+                    case,
+                    qa_chat_id=qa_chat_id,
+                    timeout_s=args.timeout,
+                    trace=args.trace,
+                )
+            finally:
+                await _close_pipeline(pipeline)
+        finally:
+            await _close_async_resource(embedder)
         result["ingest"] = ingest_info
         result["tool_policy"] = _tool_policy_for_case(
             case,

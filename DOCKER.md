@@ -5,19 +5,50 @@
 1. 配置 `.env` 文件
 2. 启动服务：
    ```bash
-   docker-compose up -d
+   docker compose up -d --build
    ```
+
+本地默认会让容器通过宿主机代理访问 Telegram：
+
+```bash
+http://host.docker.internal:7897
+```
+
+如果你要换端口：
+
+```bash
+BOT_HTTP_PROXY=http://host.docker.internal:7890 \
+BOT_HTTPS_PROXY=http://host.docker.internal:7890 \
+docker compose up -d --build
+```
+
+注意：在容器里不要用 `127.0.0.1:7897` 指向宿主机代理；那会变成容器自己的 loopback。
+
+## 本地保活
+
+如果 Docker Desktop 或容器经常掉，可以直接跑：
+
+```bash
+./infra/docker_keepalive.sh
+```
+
+它会：
+
+- 在 macOS 上尝试启动 Docker Desktop
+- 构建并拉起 `bot` 服务
+- 发现容器 missing / exited / unhealthy 时自动重启
+- 每轮间隔默认 30 秒，可用 `INTERVAL_SECONDS=60` 调整
 
 ## 停止服务
 
 ```bash
-docker-compose down
+docker compose down
 ```
 
 ## 查看日志
 
 ```bash
-docker-compose logs -f
+docker compose logs -f bot
 ```
 
 ## 部署到云平台

@@ -44,11 +44,23 @@ CREATE TABLE IF NOT EXISTS conversation_sessions (
     user_id INTEGER NOT NULL,
     chat_id INTEGER NOT NULL,
     messages_json TEXT NOT NULL DEFAULT '[]',
+    last_consolidated INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, chat_id)
 );
 """
+
+
+def _ensure_conversation_session_columns(conn: sqlite3.Connection) -> None:
+    """Apply lightweight migrations for existing conversation_sessions tables."""
+    rows = conn.execute("PRAGMA table_info(conversation_sessions)").fetchall()
+    existing = {str(row[1]) for row in rows}
+    if "last_consolidated" not in existing:
+        conn.execute(
+            "ALTER TABLE conversation_sessions "
+            "ADD COLUMN last_consolidated INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def init_db() -> None:
@@ -61,6 +73,7 @@ def init_db() -> None:
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
     conn.executescript(TABLE_SCHEMA)
+    _ensure_conversation_session_columns(conn)
     conn.commit()
     conn.close()
 

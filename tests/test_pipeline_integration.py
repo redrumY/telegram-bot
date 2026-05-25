@@ -22,10 +22,14 @@ from agent.pipeline.phases.after_turn import AfterTurnPhase
 from agent.pipeline.phases.before_reasoning import BeforeReasoningPhase
 from agent.pipeline.phases.before_turn import BeforeTurnPhase
 from agent.pipeline.reasoner import Reasoner
+from agent.tools import ToolRegistry
+from agent.tools.memory import register_memory_tools
 from channels.telegram.adapter import TelegramAdapter
+from memory.bootstrap import build_memory_runtime
 from memory.embedder import Embedder
 from memory.store import MemoryStore
 from persistence.database import init_db
+from persistence.session_store import get_session_store
 
 
 class MockTelegramAdapter(TelegramAdapter):
@@ -50,6 +54,17 @@ def _mock_choice(content: str, finish_reason="stop"):
     return choice
 
 
+def _memory_wiring(embedder: Embedder, store: MemoryStore):
+    runtime = build_memory_runtime(
+        embedder=embedder,
+        memory_store=store,
+        session_store=get_session_store(),
+    )
+    registry = ToolRegistry()
+    register_memory_tools(registry, runtime.engine)
+    return runtime, registry
+
+
 async def test_end_to_end_pipeline():
     """Test full pipeline from inbound message to outbound message."""
     init_db()
@@ -70,12 +85,18 @@ async def test_end_to_end_pipeline():
         # Add some test memories
         await store.upsert_item("fact", "用户名字叫张三", user_id=999)
         await store.upsert_item("preference", "用户喜欢吃苹果", user_id=999)
+        memory_runtime, tool_registry = _memory_wiring(embedder, store)
 
         # Create phases
-        before_turn = BeforeTurnPhase(embedder, store)
+        before_turn = BeforeTurnPhase(memory_engine=memory_runtime.engine)
         await before_turn.preheat() if hasattr(before_turn, 'preheat') else None
 
-        before_reasoning = BeforeReasoningPhase()
+        before_reasoning = BeforeReasoningPhase(
+            tool_registry=tool_registry,
+            self_model_reader=memory_runtime.markdown.store.read_self,
+            long_term_memory_reader=memory_runtime.markdown.store.read_long_term,
+            recent_context_reader=memory_runtime.markdown.store.read_recent_context,
+        )
         await before_reasoning.preheat()
 
         # Mock reasoner
@@ -86,7 +107,7 @@ async def test_end_to_end_pipeline():
             mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
             MockClient.return_value = mock_client
 
-            reasoner = Reasoner()
+            reasoner = Reasoner(tool_registry=tool_registry, event_bus=event_bus)
 
         after_reasoning = AfterReasoningPhase(store)
         after_turn = AfterTurnPhase(event_bus, adapter)
@@ -98,6 +119,8 @@ async def test_end_to_end_pipeline():
             reasoner=reasoner,
             after_reasoning=after_reasoning,
             after_turn=after_turn,
+            store=store,
+            memory_runtime=memory_runtime,
         )
 
         # Create inbound message
@@ -118,6 +141,9 @@ async def test_end_to_end_pipeline():
         # Verify message was sent via adapter
         assert len(adapter.sent_messages) == 1
         assert adapter.sent_messages[0].content == "Hello, I remember you."
+        recent_context = memory_runtime.markdown.store.read_recent_context(999)
+        assert "[user] 你好，我是谁？" in recent_context
+        assert "[a-preview] Hello, I remember you." in recent_context
 
         # Verify TurnCommittedEvent was emitted
         assert len(emitted_events) == 1
@@ -139,9 +165,15 @@ async def test_pipeline_with_empty_session():
     with patch.object(Embedder, "embed", new=AsyncMock(return_value=[0.1] * 1024)):
         embedder = Embedder()
         store = MemoryStore(embedder)
+        memory_runtime, tool_registry = _memory_wiring(embedder, store)
 
-        before_turn = BeforeTurnPhase(embedder, store)
-        before_reasoning = BeforeReasoningPhase()
+        before_turn = BeforeTurnPhase(memory_engine=memory_runtime.engine)
+        before_reasoning = BeforeReasoningPhase(
+            tool_registry=tool_registry,
+            self_model_reader=memory_runtime.markdown.store.read_self,
+            long_term_memory_reader=memory_runtime.markdown.store.read_long_term,
+            recent_context_reader=memory_runtime.markdown.store.read_recent_context,
+        )
         await before_reasoning.preheat()
 
         with patch("agent.pipeline.reasoner.AsyncOpenAI") as MockClient:
@@ -151,7 +183,7 @@ async def test_pipeline_with_empty_session():
             mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
             MockClient.return_value = mock_client
 
-            reasoner = Reasoner()
+            reasoner = Reasoner(tool_registry=tool_registry, event_bus=event_bus)
 
         after_reasoning = AfterReasoningPhase(store)
         after_turn = AfterTurnPhase(event_bus, adapter)
@@ -162,6 +194,8 @@ async def test_pipeline_with_empty_session():
             reasoner=reasoner,
             after_reasoning=after_reasoning,
             after_turn=after_turn,
+            store=store,
+            memory_runtime=memory_runtime,
         )
 
         inbound = InboundMessage(user_id=1, chat_id=1, content="Hello")
@@ -183,9 +217,15 @@ async def test_pipeline_session_persistence():
     with patch.object(Embedder, "embed", new=AsyncMock(return_value=[0.1] * 1024)):
         embedder = Embedder()
         store = MemoryStore(embedder)
+        memory_runtime, tool_registry = _memory_wiring(embedder, store)
 
-        before_turn = BeforeTurnPhase(embedder, store)
-        before_reasoning = BeforeReasoningPhase()
+        before_turn = BeforeTurnPhase(memory_engine=memory_runtime.engine)
+        before_reasoning = BeforeReasoningPhase(
+            tool_registry=tool_registry,
+            self_model_reader=memory_runtime.markdown.store.read_self,
+            long_term_memory_reader=memory_runtime.markdown.store.read_long_term,
+            recent_context_reader=memory_runtime.markdown.store.read_recent_context,
+        )
         await before_reasoning.preheat()
 
         with patch("agent.pipeline.reasoner.AsyncOpenAI") as MockClient:
@@ -195,7 +235,7 @@ async def test_pipeline_session_persistence():
             )
             MockClient.return_value = mock_client
 
-            reasoner = Reasoner()
+            reasoner = Reasoner(tool_registry=tool_registry, event_bus=event_bus)
 
         after_reasoning = AfterReasoningPhase(store)
         after_turn = AfterTurnPhase(event_bus, adapter)
@@ -206,6 +246,8 @@ async def test_pipeline_session_persistence():
             reasoner=reasoner,
             after_reasoning=after_reasoning,
             after_turn=after_turn,
+            store=store,
+            memory_runtime=memory_runtime,
         )
 
         user_id, chat_id = 555, 666

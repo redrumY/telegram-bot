@@ -1,12 +1,110 @@
 import asyncio
 import json
-from datetime import datetime, timedelta
+import re
+from collections.abc import Sequence
 
 from openai import AsyncOpenAI
 
-from agent.core.types import BeforeReasoningCtx, ReasonerResult
-from memory.store import LONG_TERM_MEMORY_TYPES
+from agent.core.event_bus import EventBus
+from agent.core.types import (
+    AfterToolResultCtx,
+    AfterStepCtx,
+    BeforeReasoningCtx,
+    BeforeStepCtx,
+    BeforeToolCallCtx,
+    ReasonerResult,
+)
+from agent.lifecycle.phase import (
+    PhaseFrame,
+    PhaseModuleRunner,
+    append_string_exports,
+    collect_prefixed_slots,
+)
+from agent.tool_hooks.executor import ToolExecutor
+from agent.tools.registry import ToolRegistry
+from agent.tools.runtime import ToolRuntime, unwrap_tool_envelope
 from config.settings import settings
+
+
+_MAX_LLM_ITERATIONS = 4
+_EVIDENCE_SOURCE_TOOLS = {"recall_memory", "search_messages"}
+_RAW_SEARCH_GUARD_KEYWORDS = (
+    "现在",
+    "以前",
+    "之前",
+    "曾经",
+    "全部",
+    "变化",
+    "更新",
+    "后来",
+    "还",
+    "还是",
+    "不再",
+    "戒",
+    "改",
+    "换",
+    "项目",
+    "擅长",
+    "技术栈",
+)
+_MEMORY_GUARD_KEYWORDS = (
+    "我",
+    "我的",
+    "给我",
+    "推荐",
+    "建议",
+    "喜欢",
+    "偏好",
+    "记得",
+    "以前",
+    "之前",
+    "上次",
+    "后来",
+    "现在",
+    "做过",
+    "用什么",
+    "是什么",
+    "喝什么",
+    "吃什么",
+)
+_SEARCH_DOMAIN_TERMS = (
+    "咖啡",
+    "拿铁",
+    "茶",
+    "饮料",
+    "偏好",
+    "生日",
+    "公司",
+    "城市",
+    "居住",
+    "工作",
+    "手机",
+    "iPhone",
+    "Android",
+    "Python",
+    "FastAPI",
+    "Rust",
+    "后端",
+    "工程师",
+    "技术栈",
+    "项目",
+    "音乐",
+    "爵士",
+    "古典",
+    "摇滚",
+)
+_SEARCH_ACTION_TERMS = (
+    "喜欢",
+    "常用",
+    "擅长",
+    "戒",
+    "改喝",
+    "换",
+    "推荐",
+    "建议",
+    "现在",
+    "以前",
+)
 
 
 class Reasoner:
@@ -14,9 +112,11 @@ class Reasoner:
 
     def __init__(
         self,
-        store: "MemoryStore | None" = None,
-        embedder: "Embedder | None" = None,
-        session_store: "SessionStore | None" = None,
+        tool_registry: ToolRegistry | None = None,
+        tool_executor: ToolExecutor | None = None,
+        event_bus: EventBus | None = None,
+        before_step_modules: Sequence[object] | None = None,
+        after_step_modules: Sequence[object] | None = None,
     ) -> None:
         self.client = AsyncOpenAI(
             api_key=settings.DEEPSEEK_API_KEY,
@@ -24,396 +124,102 @@ class Reasoner:
             timeout=60.0,
         )
         self.model = settings.LLM_MODEL
-        self._store = store
-        self._embedder = embedder
-        self._session_store = session_store
-
-    async def _execute_tool(self, tool_name: str, arguments: dict, ctx: BeforeReasoningCtx) -> str:
-        """Execute a tool call. 工具结果以 JSON 字符串返回给 LLM。"""
-        if tool_name == "memorize":
-            return await self._memorize(arguments, ctx)
-
-        if tool_name == "recall_memory":
-            return await self._recall_memory(arguments, ctx)
-
-        if tool_name == "fetch_messages":
-            return await self._fetch_messages(arguments)
-
-        if tool_name == "search_messages":
-            return await self._search_messages(arguments, ctx)
-
-        return json.dumps({"error": f"Unknown tool: {tool_name}"})
-
-    async def _memorize(self, args: dict, ctx: BeforeReasoningCtx) -> str:
-        """
-        memorize 工具：将用户明确要求记住的内容写入 MemoryStore。
-
-        对应 akashic-agent MemorizeTool → engine.remember() → Memorizer.save_item_with_supersede()。
-
-        参数对齐 akashic：summary + memory_type (procedure/preference/event/profile)。
-        """
-        if not self._store or not self._embedder:
-            return json.dumps(
-                {"status": "failed", "error": "memory_not_available"},
-                ensure_ascii=False,
-            )
-
-        summary = str(args.get("summary", "")).strip()
-        memory_type = str(args.get("memory_type", "")).strip()
-
-        if not summary or not memory_type:
-            return json.dumps(
-                {"status": "failed", "error": "summary and memory_type required"},
-                ensure_ascii=False,
-            )
-
-        if memory_type not in ("procedure", "preference", "event", "profile"):
-            return json.dumps(
-                {"status": "failed", "error": f"invalid memory_type: {memory_type}"},
-                ensure_ascii=False,
-            )
-
-        try:
-            user_id = ctx.session.user_id
-            chat_id = ctx.session.chat_id
-            source_ref = f"session:{user_id}:{chat_id}"
-
-            item = await self._store.upsert_item(
-                memory_type=memory_type,
-                summary=summary,
-                user_id=user_id,
-                source_ref=source_ref,
-            )
-
-            return json.dumps(
-                {
-                    "status": "saved",
-                    "item_id": str(item.id),
-                    "summary": summary,
-                    "memory_type": memory_type,
-                },
-                ensure_ascii=False,
-            )
-        except Exception as e:
-            return json.dumps(
-                {"status": "failed", "error": str(e)},
-                ensure_ascii=False,
-            )
-
-    async def _recall_memory(self, args: dict, ctx: BeforeReasoningCtx) -> str:
-        """
-        recall_memory 工具：语义+关键词混合检索长期记忆。
-
-        对应 akashic-agent RecallMemoryTool → retrieve_explicit()。
-
-        返回格式：
-        {
-          "count": N,
-          "items": [
-            {"id": "...", "memory_type": "...", "summary": "...",
-             "source_ref": "...", "score": 0.95},
-            ...
-          ]
-        }
-        """
-        if not self._store or not self._embedder:
-            return json.dumps({"count": 0, "items": [], "error": "memory_not_available"})
-
-        query = str(args.get("query", "")).strip()
-        if not query:
-            return json.dumps({"count": 0, "items": []}, ensure_ascii=False)
-
-        memory_type = str(args.get("memory_type", "")).strip() or None
-        include_superseded = bool(args.get("include_superseded", False))
-        search_mode = str(args.get("search_mode", "semantic")).strip() or "semantic"
-        time_filter = str(args.get("time_filter", "")).strip()
-        memory_types = _infer_memory_types(
-            query=query,
-            explicit_memory_type=memory_type,
-            search_mode=search_mode,
-            time_filter=time_filter,
+        self._tool_registry = tool_registry
+        self._tool_executor = tool_executor or ToolExecutor()
+        self._tool_runtime = ToolRuntime(
+            registry=self._tool_registry,
+            executor=self._tool_executor,
         )
-        time_window = _parse_time_filter(time_filter)
-        if time_filter and time_window is None:
-            return json.dumps(
-                {"count": 0, "items": [], "error": "invalid_time_filter"},
-                ensure_ascii=False,
+        self._event_bus = event_bus or EventBus.get_instance()
+        self.set_step_modules(
+            before_step=before_step_modules,
+            after_step=after_step_modules,
+        )
+
+    def set_step_modules(
+        self,
+        *,
+        before_step: Sequence[object] | None = None,
+        after_step: Sequence[object] | None = None,
+    ) -> None:
+        self._before_step_modules = list(before_step or [])
+        self._after_step_modules = list(after_step or [])
+
+    def add_tool_hooks(self, hooks) -> None:
+        self._tool_executor.add_hooks(hooks)
+
+    async def close(self) -> None:
+        await self.client.close()
+
+    async def _execute_tool(
+        self,
+        tool_name: str,
+        arguments: dict | str,
+        ctx: BeforeReasoningCtx,
+        *,
+        call_id: str = "",
+        tool_batch: tuple[dict, ...] = (),
+        tool_batch_index: int = 0,
+    ) -> str:
+        """Execute a tool call. 工具结果以 JSON 字符串返回给 LLM。"""
+        session_key, channel, chat_id = _tool_context(ctx)
+        observed_args = arguments if isinstance(arguments, dict) else _load_json_object(arguments)
+        await self._event_bus.observe(
+            BeforeToolCallCtx(
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                tool_name=tool_name,
+                arguments=dict(observed_args),
             )
-        if search_mode not in {"semantic", "grep"}:
-            search_mode = "semantic"
-        max_limit = 50 if search_mode == "grep" else 10
-        limit = max(1, min(int(args.get("limit", 5)), max_limit))
-        user_id = int(args.get("user_id") or ctx.session.user_id)
+        )
 
-        try:
-            if search_mode == "grep":
-                if time_window is None:
-                    return json.dumps(
-                        {"count": 0, "items": [], "error": "time_filter_required"},
-                        ensure_ascii=False,
-                    )
-                start, end = time_window
-                grep_results = self._store.list_memories(
-                    user_id=user_id,
-                    memory_types=[memory_type] if memory_type else ["event"],
-                    include_superseded=include_superseded,
-                    created_start=start,
-                    created_end=end,
-                    limit=limit,
-                )
-                return json.dumps(
-                    {
-                        "count": len(grep_results),
-                        "applied_memory_types": [memory_type] if memory_type else ["event"],
-                        "items": [
-                            {
-                                "id": str(mem.id),
-                                "memory_type": mem.memory_type,
-                                "summary": mem.summary,
-                                "source_ref": mem.source_ref,
-                                "status": mem.status,
-                                "score": 1.0,
-                            }
-                            for mem in grep_results
-                        ],
-                    },
-                    ensure_ascii=False,
-                )
-
-            # 1. 向量检索
-            query_vec = await self._embedder.embed(query)
-            vec_results = await self._store.vector_search(
-                query_vec=query_vec,
-                user_id=user_id,
-                top_k=limit,
-                memory_types=memory_types,
-                include_superseded=include_superseded,
+        runtime_result = await self._tool_runtime.execute_call(
+            call_id=call_id,
+            tool_name=tool_name,
+            raw_arguments=arguments,
+            ctx=ctx,
+            source="passive",
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            request_text=ctx.content,
+            tool_batch=tool_batch,
+            tool_batch_index=tool_batch_index,
+        )
+        result = runtime_result.to_json()
+        await self._event_bus.observe(
+            AfterToolResultCtx(
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                tool_name=tool_name,
+                arguments=runtime_result.final_arguments,
+                result=result,
+                status=runtime_result.status,
             )
+        )
+        return result
 
-            # 2. 关键词检索（补充）
-            kw_results = await self._store.keyword_search(
-                terms=query,
-                user_id=user_id,
-                limit=max(1, limit // 2),
-                memory_types=memory_types,
-                include_superseded=include_superseded,
+    async def _observe_tool_result(
+        self,
+        ctx: BeforeReasoningCtx,
+        tool_name: str,
+        arguments: dict,
+        result: str,
+        status: str,
+    ) -> None:
+        session_key, channel, chat_id = _tool_context(ctx)
+        await self._event_bus.observe(
+            AfterToolResultCtx(
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                tool_name=tool_name,
+                arguments=dict(arguments),
+                result=result,
+                status=status,
             )
-
-            # 3. 去重合并（向量结果优先）
-            seen_ids: set[str] = set()
-            items: list[dict] = []
-
-            for mem in vec_results:
-                if str(mem.id) not in seen_ids:
-                    seen_ids.add(str(mem.id))
-                    items.append({
-                        "id": str(mem.id),
-                        "memory_type": mem.memory_type,
-                        "summary": mem.summary,
-                        "source_ref": mem.source_ref,
-                        "status": mem.status,
-                        "score": 1.0,  # 向量结果无显式分数，简化
-                    })
-
-            for mem in kw_results:
-                if str(mem.id) not in seen_ids:
-                    seen_ids.add(str(mem.id))
-                    items.append({
-                        "id": str(mem.id),
-                        "memory_type": mem.memory_type,
-                        "summary": mem.summary,
-                        "source_ref": mem.source_ref,
-                        "status": mem.status,
-                        "score": 0.5,
-                    })
-
-            if time_window is not None:
-                start, end = time_window
-                items = [
-                    item for item in items
-                    if _memory_created_in_window(item["id"], [*vec_results, *kw_results], start, end)
-                ]
-
-            items = items[:limit]
-            return json.dumps(
-                {
-                    "count": len(items),
-                    "applied_memory_types": memory_types,
-                    "items": items,
-                },
-                ensure_ascii=False,
-            )
-
-        except Exception as e:
-            return json.dumps(
-                {"count": 0, "items": [], "error": str(e)},
-                ensure_ascii=False,
-            )
-
-    async def _fetch_messages(self, args: dict) -> str:
-        """
-        fetch_messages 工具：按 source_ref 取原始对话消息。
-
-        对应 akashic-agent FetchMessagesTool。
-
-        返回格式：
-        {
-          "matched_count": N,
-          "messages": [
-            {"role": "user", "content": "...", "seq": 0},
-            ...
-          ]
-        }
-        """
-        if not self._session_store:
-            return json.dumps(
-                {"matched_count": 0, "messages": [], "error": "session_store_not_available"},
-                ensure_ascii=False,
-            )
-
-        source_refs = _coerce_source_refs(args)
-        if not source_refs:
-            return json.dumps(
-                {"matched_count": 0, "messages": [], "error": "source_ref_required"},
-                ensure_ascii=False,
-            )
-
-        limit = max(1, min(int(args.get("limit", 20)), 50))
-        context = max(0, min(int(args.get("context", 0)), 10))
-
-        all_fetched: list[dict] = []
-        total_matched = 0
-        invalid_refs: list[str] = []
-        seen: set[tuple[str, int | None]] = set()
-        for source_ref in source_refs:
-            # 解析 source_ref: "session:user_id:chat_id" or "...#msg:<seq[-end]>"
-            user_id, chat_id, seq, seq_end = _parse_session_ref(source_ref)
-            if user_id is None or chat_id is None:
-                invalid_refs.append(source_ref)
-                continue
-
-            fetched, matched = self._session_store.fetch_messages(
-                user_id,
-                chat_id,
-                seq=seq,
-                seq_end=seq_end,
-                context=context,
-                limit=limit,
-            )
-            total_matched += matched
-            for message in fetched:
-                key = (str(message.get("source_ref", "")), message.get("seq"))
-                if key in seen:
-                    continue
-                seen.add(key)
-                all_fetched.append(message)
-
-        if not all_fetched:
-            payload = {"matched_count": 0, "messages": []}
-            if invalid_refs:
-                payload["error"] = f"invalid_source_ref: {', '.join(invalid_refs)}"
-            return json.dumps(payload, ensure_ascii=False)
-
-        if len(all_fetched) > limit:
-            all_fetched = all_fetched[:limit]
-
-        if not all_fetched:
-            return json.dumps({"matched_count": 0, "messages": []}, ensure_ascii=False)
-
-        result_messages = [
-            {
-                "role": m.get("role", "?"),
-                "content": str(m.get("content", ""))[:500],
-                "seq": m.get("seq"),
-                "source_ref": m.get("source_ref", ""),
-                "in_source_ref": bool(m.get("in_source_ref")),
-            }
-            for m in all_fetched
-        ]
-
-        payload = {
-            "matched_count": total_matched,
-            "source_refs": source_refs,
-            "messages": result_messages,
-        }
-        if invalid_refs:
-            payload["invalid_source_refs"] = invalid_refs
-        if len(source_refs) == 1:
-            payload["source_ref"] = source_refs[0]
-        return json.dumps(payload, ensure_ascii=False)
-
-    async def _search_messages(self, args: dict, ctx: BeforeReasoningCtx) -> str:
-        """
-        search_messages 工具：对持久化原始会话做关键词搜索。
-
-        对应 akashic-agent SearchMessagesTool。返回 source_ref，供
-        fetch_messages 继续回源取证。
-        """
-        if not self._session_store:
-            return json.dumps(
-                {
-                    "count": 0,
-                    "matched_count": 0,
-                    "messages": [],
-                    "error": "session_store_not_available",
-                },
-                ensure_ascii=False,
-            )
-
-        query = str(args.get("query", "")).strip()
-        if not query:
-            return json.dumps(
-                {
-                    "count": 0,
-                    "matched_count": 0,
-                    "messages": [],
-                    "has_more": False,
-                    "next_offset": None,
-                },
-                ensure_ascii=False,
-            )
-
-        limit = max(1, min(int(args.get("limit", 10)), 50))
-        offset = max(0, int(args.get("offset", 0)))
-        role = str(args.get("role", "")).strip() or None
-        user_id = int(args.get("user_id") or ctx.session.user_id)
-
-        try:
-            messages, total = self._session_store.search_messages(
-                query,
-                user_id=user_id,
-                role=role,
-                limit=limit,
-                offset=offset,
-            )
-        except Exception as e:
-            return json.dumps(
-                {"count": 0, "matched_count": 0, "messages": [], "error": str(e)},
-                ensure_ascii=False,
-            )
-
-        public_messages = [
-            {
-                "role": m.get("role", ""),
-                "content": str(m.get("content", ""))[:300],
-                "seq": m.get("seq"),
-                "source_ref": m.get("source_ref", ""),
-            }
-            for m in messages
-        ]
-        next_offset = offset + len(public_messages)
-        has_more = next_offset < total
-        return json.dumps(
-            {
-                "count": len(public_messages),
-                "matched_count": total,
-                "limit": limit,
-                "offset": offset,
-                "has_more": has_more,
-                "next_offset": next_offset if has_more else None,
-                "messages": public_messages,
-            },
-            ensure_ascii=False,
         )
 
     async def run_turn(self, ctx: BeforeReasoningCtx) -> ReasonerResult:
@@ -421,7 +227,21 @@ class Reasoner:
         messages = ctx.messages.copy()
         tool_calls: list[dict] = []
 
-        for iteration in range(3):
+        for iteration in range(_MAX_LLM_ITERATIONS):
+            step_ctx = await self._run_before_step(ctx, iteration, messages)
+            if step_ctx.early_stop:
+                return ReasonerResult(
+                    content=step_ctx.early_stop_reply or "",
+                    tool_calls=tool_calls,
+                    finish_reason="early_stop",
+                )
+            if step_ctx.extra_hints:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "# Step Hints\n" + "\n".join(step_ctx.extra_hints),
+                    }
+                )
             try:
                 response = await self.client.chat.completions.create(
                     model=self.model,
@@ -439,6 +259,7 @@ class Reasoner:
 
             # Check for tool calls
             if message.tool_calls:
+                iteration_tool_names = tuple(tc.function.name for tc in message.tool_calls)
                 tool_calls.extend([
                     {
                         "id": tc.id,
@@ -470,21 +291,97 @@ class Reasoner:
 
                 # Execute tools and add responses
                 for idx, tc in enumerate(message.tool_calls):
-                    args = json.loads(tc.function.arguments)
-                    result = await self._execute_tool(tc.function.name, args, ctx)
-                    tool_calls[len(tool_calls) - len(message.tool_calls) + idx]["result"] = result
+                    tool_batch = _tool_call_batch_snapshot(message.tool_calls)
+                    result = await self._execute_tool(
+                        tc.function.name,
+                        tc.function.arguments,
+                        ctx,
+                        call_id=tc.id,
+                        tool_batch=tool_batch,
+                        tool_batch_index=idx,
+                    )
+                    call_record = tool_calls[len(tool_calls) - len(message.tool_calls) + idx]
+                    call_record["result"] = result
+                    _annotate_tool_call_from_runtime(call_record, result)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": result,
                     })
 
+                guard_tools = await self._run_raw_search_guard(
+                    ctx=ctx,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                )
+                guard_tools.extend(
+                    await self._run_evidence_fetch_guard(
+                        ctx=ctx,
+                        messages=messages,
+                        tool_calls=tool_calls,
+                    )
+                )
+                await self._run_after_step(
+                    ctx=ctx,
+                    iteration=iteration,
+                    tools_called=iteration_tool_names + tuple(guard_tools),
+                    partial_reply=message.content or "",
+                    tool_calls=tool_calls,
+                    has_more=True,
+                )
                 # Continue loop for LLM to respond with final answer
                 continue
             else:
+                guard_tools: list[str] = []
+                recall_guard_tools = await self._run_explicit_recall_guard(
+                    ctx=ctx,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                )
+                if recall_guard_tools:
+                    guard_tools.extend(recall_guard_tools)
+                search_guard_tools = await self._run_raw_search_guard(
+                    ctx=ctx,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                )
+                if search_guard_tools:
+                    guard_tools.extend(search_guard_tools)
+                evidence_guard_tools = await self._run_evidence_fetch_guard(
+                    ctx=ctx,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                )
+                if evidence_guard_tools:
+                    guard_tools.extend(
+                        evidence_guard_tools
+                    )
+                if guard_tools:
+                    await self._run_after_step(
+                        ctx=ctx,
+                        iteration=iteration,
+                        tools_called=tuple(guard_tools),
+                        partial_reply=message.content or "",
+                        tool_calls=tool_calls,
+                        has_more=True,
+                    )
+                    continue
+                await self._run_after_step(
+                    ctx=ctx,
+                    iteration=iteration,
+                    tools_called=(),
+                    partial_reply=message.content or "",
+                    tool_calls=tool_calls,
+                    has_more=False,
+                )
                 # No tool calls, this is the final response
+                content = _apply_final_answer_guard(
+                    ctx,
+                    message.content or "",
+                    tool_calls,
+                )
                 return ReasonerResult(
-                    content=message.content or "",
+                    content=content,
                     tool_calls=tool_calls,
                     finish_reason=choice.finish_reason or "stop",
                 )
@@ -496,191 +393,676 @@ class Reasoner:
             finish_reason="max_iterations",
         )
 
+    async def _run_evidence_fetch_guard(
+        self,
+        *,
+        ctx: BeforeReasoningCtx,
+        messages: list[dict],
+        tool_calls: list[dict],
+    ) -> list[str]:
+        if not _tool_is_visible(ctx, "fetch_messages"):
+            return []
+        if self._tool_registry is None or not self._tool_registry.has_tool("fetch_messages"):
+            return []
+        source_refs = _pending_evidence_source_refs(tool_calls)
+        if not source_refs:
+            return []
 
-def _parse_session_ref(source_ref: str) -> tuple[int | None, int | None, int | None, int | None]:
-    """解析 source_ref 格式 'session:user_id:chat_id[#msg:seq[-end]]'"""
-    base, _, suffix = source_ref.partition("#")
-    parts = base.split(":")
-    if len(parts) >= 3 and parts[0] == "session":
-        try:
-            seq = None
-            seq_end = None
-            if suffix.startswith("msg:"):
-                raw_seq = suffix.split(":", 1)[1]
-                if "-" in raw_seq:
-                    left, right = raw_seq.split("-", 1)
-                    seq = int(left)
-                    seq_end = int(right)
-                else:
-                    seq = int(raw_seq)
-            return int(parts[1]), int(parts[2]), seq, seq_end
-        except (ValueError, IndexError):
-            pass
-    return None, None, None, None
+        args = {
+            "source_refs": source_refs[:5],
+            "context": 2,
+            "limit": 20,
+        }
+        call_id = f"guard_fetch_{len(tool_calls) + 1}"
+        arguments = json.dumps(args, ensure_ascii=False)
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "fetch_messages",
+                    "arguments": arguments,
+                },
+                "guard": "source_ref_requires_fetch",
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "fetch_messages",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            }
+        )
+        result = await self._execute_tool("fetch_messages", args, ctx)
+        tool_calls[-1]["result"] = result
+        _annotate_tool_call_from_runtime(tool_calls[-1], result)
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": result,
+            }
+        )
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "# Evidence Guard\n"
+                    "fetch_messages 已读取 source_ref 原文。最终回答必须基于这些原文证据；"
+                    "如果证据不足，明确说明不足。"
+                    "若本轮 recall_memory 返回了 active 与 superseded 记忆，"
+                    "active 代表当前有效事实，superseded 代表被替代的历史事实；"
+                    "当前状态、推荐、偏好、身份类问题必须优先使用 active，"
+                    "只有用户明确问以前/历史/变化过程时才使用 superseded 作为结论。"
+                ),
+            }
+        )
+        return ["fetch_messages"]
+
+    async def _run_explicit_recall_guard(
+        self,
+        *,
+        ctx: BeforeReasoningCtx,
+        messages: list[dict],
+        tool_calls: list[dict],
+    ) -> list[str]:
+        if not _should_force_explicit_recall(ctx, tool_calls):
+            return []
+        if self._tool_registry is None or not self._tool_registry.has_tool("recall_memory"):
+            return []
+
+        args = _recall_guard_args(ctx)
+        call_id = f"guard_recall_{len(tool_calls) + 1}"
+        arguments = json.dumps(args, ensure_ascii=False)
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "recall_memory",
+                    "arguments": arguments,
+                },
+                "guard": "passive_memory_requires_explicit_recall",
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "recall_memory",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            }
+        )
+        result = await self._execute_tool("recall_memory", args, ctx)
+        tool_calls[-1]["result"] = result
+        _annotate_tool_call_from_runtime(tool_calls[-1], result)
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": result,
+            }
+        )
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "# Memory Guard\n"
+                    "系统检测到本轮回答正在使用已注入的历史记忆。"
+                    "已补充一次 recall_memory；最终回答必须以显式检索结果为准。"
+                ),
+            }
+        )
+        return ["recall_memory"]
+
+    async def _run_raw_search_guard(
+        self,
+        *,
+        ctx: BeforeReasoningCtx,
+        messages: list[dict],
+        tool_calls: list[dict],
+    ) -> list[str]:
+        if not _should_force_raw_search(ctx, tool_calls):
+            return []
+        if self._tool_registry is None or not self._tool_registry.has_tool("search_messages"):
+            return []
+
+        args = {
+            "query": _search_guard_query(ctx, tool_calls),
+            "role": "user",
+            "limit": 10,
+        }
+        call_id = f"guard_search_{len(tool_calls) + 1}"
+        arguments = json.dumps(args, ensure_ascii=False)
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "search_messages",
+                    "arguments": arguments,
+                },
+                "guard": "recall_requires_raw_search",
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "search_messages",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            }
+        )
+        result = await self._execute_tool("search_messages", args, ctx)
+        tool_calls[-1]["result"] = result
+        _annotate_tool_call_from_runtime(tool_calls[-1], result)
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": result,
+            }
+        )
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "# Raw Search Guard\n"
+                    "本轮问题涉及历史更新、变化过程或基于用户长期信息的建议。"
+                    "已补充 search_messages 定位原始消息；若返回 source_ref，必须回源取证后回答。"
+                ),
+            }
+        )
+        return ["search_messages"]
+
+    async def _run_before_step(
+        self,
+        ctx: BeforeReasoningCtx,
+        iteration: int,
+        messages: list[dict],
+    ) -> BeforeStepCtx:
+        session_key, channel, chat_id = _tool_context(ctx)
+        visible_tool_names = frozenset(
+            str(tool.get("function", {}).get("name", ""))
+            for tool in ctx.tools
+            if tool.get("function", {}).get("name")
+        )
+        step_ctx = BeforeStepCtx(
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            iteration=iteration,
+            input_tokens_estimate=_estimate_message_tokens(messages),
+            visible_tool_names=visible_tool_names,
+        )
+        plugin_runner = PhaseModuleRunner(
+            self._before_step_modules,
+            phase_name="before_step",
+        )
+        frame = PhaseFrame(
+            input=messages,
+            slots={
+                "step:ctx": step_ctx,
+                "before_step.build_ctx": True,
+            },
+        )
+        frame = await plugin_runner.run_ready(frame)
+        step_ctx = frame.slots.get("step:ctx", step_ctx)
+        emitted = await self._event_bus.emit(step_ctx)
+        if emitted is not None:
+            step_ctx = emitted
+        frame.slots["step:ctx"] = step_ctx
+        frame.slots["before_step.emit"] = True
+        frame = await plugin_runner.run_ready(frame)
+        step_ctx = frame.slots.get("step:ctx", step_ctx)
+        append_string_exports(
+            step_ctx.extra_hints,
+            collect_prefixed_slots(frame.slots, "step:extra_hint:"),
+        )
+        frame.slots["before_step.collect_exports"] = True
+        abort_reply = frame.slots.get("step:abort_reply")
+        if isinstance(abort_reply, str) and abort_reply:
+            step_ctx.early_stop = True
+            step_ctx.early_stop_reply = abort_reply
+        frame.slots["before_step.inject_hints"] = True
+        frame.slots["before_step.return"] = True
+        plugin_runner.warn_unresolved()
+        return step_ctx
+
+    async def _run_after_step(
+        self,
+        *,
+        ctx: BeforeReasoningCtx,
+        iteration: int,
+        tools_called: tuple[str, ...],
+        partial_reply: str,
+        tool_calls: list[dict],
+        has_more: bool,
+    ) -> AfterStepCtx:
+        session_key, channel, chat_id = _tool_context(ctx)
+        tools_used = tuple(
+            call.get("function", {}).get("name", "")
+            for call in tool_calls
+            if call.get("function", {}).get("name")
+        )
+        step_ctx = AfterStepCtx(
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            iteration=iteration,
+            tools_called=tools_called,
+            partial_reply=partial_reply,
+            tools_used_so_far=tools_used,
+            tool_chain_partial=tuple(tool_calls),
+            partial_thinking=None,
+            has_more=has_more,
+        )
+        plugin_runner = PhaseModuleRunner(
+            self._after_step_modules,
+            phase_name="after_step",
+        )
+        frame = PhaseFrame(
+            input=step_ctx,
+            slots={
+                "step:ctx": step_ctx,
+                "after_step.copy_input": True,
+            },
+        )
+        frame = await plugin_runner.run_ready(frame)
+        step_ctx = frame.slots.get("step:ctx", step_ctx)
+        step_ctx.extra_metadata.update(
+            collect_prefixed_slots(frame.slots, "step:telemetry:")
+        )
+        await self._event_bus.observe(step_ctx)
+        frame.slots["step:ctx"] = step_ctx
+        frame.slots["after_step.fanout"] = True
+        frame = await plugin_runner.run_ready(frame)
+        collected = set(collect_prefixed_slots(frame.slots, "step:telemetry:"))
+        step_ctx = frame.slots.get("step:ctx", step_ctx)
+        late_telemetry = collect_prefixed_slots(frame.slots, "step:telemetry:")
+        for key, value in late_telemetry.items():
+            if key not in collected:
+                step_ctx.extra_metadata[key] = value
+        frame.slots["after_step.collect_telemetry"] = True
+        frame.slots["after_step.return"] = True
+        plugin_runner.warn_unresolved()
+        return step_ctx
 
 
-def _infer_memory_types(
-    *,
-    query: str,
-    explicit_memory_type: str | None,
-    search_mode: str,
-    time_filter: str,
-) -> list[str]:
-    """Infer a conservative memory_type filter when the model omits it."""
-    if explicit_memory_type:
-        return [explicit_memory_type]
-    if search_mode == "grep" or time_filter:
-        return ["event"]
+def _tool_call_batch_snapshot(tool_calls) -> tuple[dict, ...]:
+    batch: list[dict] = []
+    for tool_call in tool_calls:
+        batch.append(
+            {
+                "name": str(tool_call.function.name),
+                "arguments": _load_json_object(str(tool_call.function.arguments or "")),
+            }
+        )
+    return tuple(batch)
 
-    text = query.lower()
-    if _contains_any(
-        text,
-        (
-            "以后",
-            "下次",
-            "你要怎么做",
-            "怎么做",
-            "流程",
-            "规则",
-            "操作规范",
-            "必须",
-            "应该",
-            "工具",
-        ),
+
+def _annotate_tool_call_from_runtime(call: dict, result: str) -> None:
+    envelope = _load_raw_json_object(result)
+    if not envelope:
+        return
+    call["status"] = str(envelope.get("status") or "")
+    error = envelope.get("error")
+    if isinstance(error, dict):
+        call["error_code"] = str(error.get("code") or "")
+    meta = envelope.get("meta")
+    if isinstance(meta, dict):
+        final_arguments = meta.get("final_arguments")
+        if isinstance(final_arguments, dict):
+            call["final_arguments"] = final_arguments
+        retry_count = meta.get("retry_count")
+        if retry_count is not None:
+            call["retry_count"] = retry_count
+
+
+def _tool_context(ctx: BeforeReasoningCtx) -> tuple[str, str, str]:
+    session_key = ctx.session_key or f"{ctx.session.user_id}:{ctx.session.chat_id}"
+    channel = ctx.channel or "telegram"
+    chat_id = ctx.chat_id or str(ctx.session.chat_id)
+    return session_key, channel, chat_id
+
+
+def _tool_is_visible(ctx: BeforeReasoningCtx, tool_name: str) -> bool:
+    return any(
+        str(tool.get("function", {}).get("name", "")) == tool_name
+        for tool in ctx.tools
+    )
+
+
+def _should_force_explicit_recall(ctx: BeforeReasoningCtx, tool_calls: list[dict]) -> bool:
+    if not _tool_is_visible(ctx, "recall_memory"):
+        return False
+    if any(
+        str(call.get("function", {}).get("name", "")) == "recall_memory"
+        for call in tool_calls
     ):
-        return ["procedure"]
-
-    if _contains_any(
-        text,
-        (
-            "今天聊",
-            "今天做",
-            "昨天聊",
-            "昨天做",
-            "最近聊",
-            "最近做",
-            "聊过什么",
-            "做过什么",
-            "发生过",
-            "历史事件",
-        ),
-    ):
-        return ["event"]
-
-    if _contains_any(
-        text,
-        (
-            "职业",
-            "工作",
-            "公司",
-            "城市",
-            "居住",
-            "住在",
-            "生日",
-            "年龄",
-            "编程语言",
-            "技术栈",
-            "手机",
-            "设备",
-            "iphone",
-            "android",
-        ),
-    ):
-        return ["profile"]
-
-    if _contains_any(
-        text,
-        (
-            "喜欢",
-            "偏好",
-            "推荐",
-            "喝",
-            "咖啡",
-            "茶",
-            "饮品",
-            "饮料",
-            "音乐",
-            "音乐人",
-            "食物",
-            "川菜",
-            "摇滚",
-            "爵士",
-            "不喜欢",
-            "讨厌",
-        ),
-    ):
-        # Preference updates may be extracted as profile status changes, so keep
-        # profile in this lane while still excluding procedure/event noise.
-        return ["preference", "profile"]
-
-    return LONG_TERM_MEMORY_TYPES
+        return False
+    if not _has_memory_context(ctx):
+        return False
+    content = _last_user_content(ctx)
+    if not content:
+        return False
+    return any(keyword in content for keyword in _MEMORY_GUARD_KEYWORDS)
 
 
-def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
-    return any(needle in text for needle in needles)
+def _has_memory_context(ctx: BeforeReasoningCtx) -> bool:
+    if ctx.memories or str(ctx.retrieved_memory_block or "").strip():
+        return True
+    return any(
+        section.name in {"long_term_memory", "self_model", "recent_context"}
+        and str(section.content or "").strip()
+        for section in ctx.prompt_sections
+    )
 
 
-def _coerce_source_refs(args: dict) -> list[str]:
+def _should_force_raw_search(ctx: BeforeReasoningCtx, tool_calls: list[dict]) -> bool:
+    if not _tool_is_visible(ctx, "search_messages"):
+        return False
+    names = [
+        str(call.get("function", {}).get("name", ""))
+        for call in tool_calls
+    ]
+    if "search_messages" in names or "recall_memory" not in names:
+        return False
+    content = _last_user_content(ctx)
+    if not content:
+        return False
+    return any(keyword in content for keyword in _RAW_SEARCH_GUARD_KEYWORDS)
+
+
+def _recall_guard_args(ctx: BeforeReasoningCtx) -> dict:
+    args: dict[str, object] = {
+        "query": _recall_guard_query(ctx),
+        "limit": 5,
+    }
+    memory_type = _dominant_memory_type(ctx)
+    if memory_type:
+        args["memory_type"] = memory_type
+    if _asks_for_history_or_updates(_last_user_content(ctx)):
+        args["include_superseded"] = True
+    return args
+
+
+def _recall_guard_query(ctx: BeforeReasoningCtx) -> str:
+    content = _last_user_content(ctx)
+    summaries = [
+        str(getattr(memory, "summary", "") or "").strip()
+        for memory in ctx.memories[:3]
+    ]
+    summaries = [summary for summary in summaries if summary]
+    if summaries:
+        return f"用户当前问题相关的长期记忆：{content}。已检索线索：{'；'.join(summaries)}"
+    return f"用户当前问题相关的长期记忆：{content}"
+
+
+def _dominant_memory_type(ctx: BeforeReasoningCtx) -> str:
+    memory_types = [
+        str(getattr(memory, "memory_type", "") or "").strip()
+        for memory in ctx.memories
+    ]
+    memory_types = [memory_type for memory_type in memory_types if memory_type]
+    if not memory_types:
+        return ""
+    first = memory_types[0]
+    if all(memory_type == first for memory_type in memory_types):
+        return first
+    return ""
+
+
+def _asks_for_history_or_updates(content: str) -> bool:
+    return any(
+        keyword in content
+        for keyword in ("以前", "之前", "上次", "曾经", "后来", "变化", "更新", "现在")
+    )
+
+
+def _last_user_content(ctx: BeforeReasoningCtx) -> str:
+    for message in reversed(ctx.messages):
+        if message.get("role") == "user":
+            content = message.get("content", "")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return str(ctx.content or "").strip()
+
+
+def _search_guard_query(ctx: BeforeReasoningCtx, tool_calls: list[dict]) -> str:
+    haystack = _search_guard_haystack(ctx, tool_calls)
+    terms: list[str] = []
+    haystack_lower = haystack.lower()
+    for term in _SEARCH_DOMAIN_TERMS:
+        if term.lower() in haystack_lower:
+            _append_search_term(terms, term)
+    for term in _SEARCH_ACTION_TERMS:
+        if term.lower() in haystack_lower:
+            _append_search_term(terms, term)
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_+.-]*|\d{2,4}", haystack):
+        _append_search_term(terms, token)
+    if terms:
+        return " ".join(terms[:10])
+    content = _last_user_content(ctx)
+    return content or haystack[:80]
+
+
+def _search_guard_haystack(ctx: BeforeReasoningCtx, tool_calls: list[dict]) -> str:
+    parts = [_last_user_content(ctx)]
+    parts.extend(
+        str(getattr(memory, "summary", "") or "").strip()
+        for memory in ctx.memories
+    )
+    for call in tool_calls:
+        if str(call.get("function", {}).get("name", "")) != "recall_memory":
+            continue
+        payload = _load_json_object(str(call.get("result", "") or ""))
+        items = payload.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                parts.append(str(item.get("summary", "") or "").strip())
+    return " ".join(part for part in parts if part)
+
+
+def _append_search_term(terms: list[str], value: str) -> None:
+    term = str(value or "").strip()
+    if term and term not in terms:
+        terms.append(term)
+
+
+def _apply_final_answer_guard(
+    ctx: BeforeReasoningCtx,
+    content: str,
+    tool_calls: list[dict],
+) -> str:
+    reply = str(content or "").strip()
+    if not reply:
+        return reply
+    if not _is_memory_grounded(tool_calls):
+        return reply
+    user_content = _last_user_content(ctx)
+    if not any(keyword in user_content for keyword in ("推荐", "建议")):
+        return reply
+    evidence_reply = _project_suggestion_from_evidence(user_content, tool_calls)
+    if evidence_reply:
+        return evidence_reply
+    if any(keyword in reply for keyword in ("根据", "喜好", "偏好", "擅长", "技术栈")):
+        return reply
+    if any(keyword in user_content for keyword in ("项目", "技术栈", "擅长")):
+        return f"根据你擅长的技术栈，{reply}"
+    return f"根据你的喜好，{reply}"
+
+
+def _is_memory_grounded(tool_calls: list[dict]) -> bool:
+    names = {
+        str(call.get("function", {}).get("name", ""))
+        for call in tool_calls
+    }
+    return "recall_memory" in names or "fetch_messages" in names
+
+
+def _project_suggestion_from_evidence(user_content: str, tool_calls: list[dict]) -> str:
+    if not any(keyword in user_content for keyword in ("项目", "技术栈", "擅长")):
+        return ""
+    evidence_text = " ".join(_fetched_message_contents(tool_calls))
+    if "Python" not in evidence_text:
+        return ""
+    frameworks = [
+        name
+        for name in ("Django", "FastAPI")
+        if name in evidence_text
+    ]
+    if not frameworks:
+        return ""
+    if len(frameworks) == 1:
+        framework_text = frameworks[0]
+    else:
+        framework_text = " 或 ".join(frameworks)
+    return f"根据你擅长的技术栈，你可以用 Python 的 {framework_text} 框架来做后端。"
+
+
+def _fetched_message_contents(tool_calls: list[dict]) -> list[str]:
+    contents: list[str] = []
+    for call in tool_calls:
+        if str(call.get("function", {}).get("name", "")) != "fetch_messages":
+            continue
+        payload = _load_json_object(str(call.get("result", "") or ""))
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if isinstance(message, dict):
+                content = str(message.get("content", "") or "").strip()
+                if content:
+                    contents.append(content)
+    return contents
+
+
+def _pending_evidence_source_refs(tool_calls: list[dict]) -> list[str]:
+    fetched_refs: list[str] = []
+    evidence_refs: list[str] = []
+    for call in tool_calls:
+        name = str(call.get("function", {}).get("name", ""))
+        result = str(call.get("result", "") or "")
+        arguments = _load_json_object(
+            str(call.get("function", {}).get("arguments", "") or "")
+        )
+        if name == "fetch_messages":
+            fetched_refs.extend(_source_refs_from_args(arguments))
+            fetched_refs.extend(_source_refs_from_payload(result))
+            continue
+        if name in _EVIDENCE_SOURCE_TOOLS:
+            evidence_refs.extend(_source_refs_from_payload(result))
+
+    return [
+        ref
+        for ref in _dedupe_refs(evidence_refs)
+        if not _is_ref_fetched(ref, fetched_refs)
+    ]
+
+
+def _source_refs_from_args(arguments: dict) -> list[str]:
     refs: list[str] = []
-    seen: set[str] = set()
-
-    def _add(value) -> None:
-        ref = str(value or "").strip()
-        if ref and ref not in seen:
-            seen.add(ref)
-            refs.append(ref)
-
-    _add(args.get("source_ref"))
-    raw_refs = args.get("source_refs")
+    _append_ref(refs, arguments.get("source_ref"))
+    raw_refs = arguments.get("source_refs")
     if isinstance(raw_refs, list):
         for ref in raw_refs:
-            _add(ref)
-    elif raw_refs:
-        _add(raw_refs)
-    return refs
+            _append_ref(refs, ref)
+    else:
+        _append_ref(refs, raw_refs)
+    return _dedupe_refs(refs)
 
 
-def _parse_time_filter(value: str) -> tuple[datetime, datetime] | None:
-    text = (value or "").strip()
-    if not text:
-        return None
-    now = datetime.utcnow()
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    if text == "today":
-        return today, today + timedelta(days=1)
-    if text == "yesterday":
-        return today - timedelta(days=1), today
-    presets = {"recent_3d": 3, "recent_7d": 7, "recent_30d": 30}
-    if text in presets:
-        return now - timedelta(days=presets[text]), now
-    if "~" in text:
-        left, right = [part.strip() for part in text.split("~", 1)]
-        try:
-            start = datetime.strptime(left, "%Y-%m-%d")
-            end = datetime.strptime(right, "%Y-%m-%d") + timedelta(days=1)
-            return start, end
-        except ValueError:
-            return None
-    try:
-        start = datetime.strptime(text, "%Y-%m-%d")
-        return start, start + timedelta(days=1)
-    except ValueError:
-        return None
-
-
-def _memory_created_in_window(
-    item_id: str,
-    memories,
-    start: datetime,
-    end: datetime,
-) -> bool:
-    for mem in memories:
-        if str(mem.id) != item_id:
+def _source_refs_from_payload(raw: str) -> list[str]:
+    payload = _load_json_object(raw)
+    refs: list[str] = []
+    _append_ref(refs, payload.get("source_ref"))
+    raw_refs = payload.get("source_refs")
+    if isinstance(raw_refs, list):
+        for ref in raw_refs:
+            _append_ref(refs, ref)
+    else:
+        _append_ref(refs, raw_refs)
+    for key in ("items", "messages"):
+        values = payload.get(key)
+        if not isinstance(values, list):
             continue
-        created_at = mem.created_at
-        if created_at is None:
-            return False
-        if created_at.tzinfo is not None:
-            created_at = created_at.replace(tzinfo=None)
-        return start <= created_at < end
+        for value in values:
+            if isinstance(value, dict):
+                _append_ref(refs, value.get("source_ref"))
+    return _dedupe_refs(refs)
+
+
+def _load_json_object(raw: str) -> dict:
+    payload = _load_raw_json_object(raw)
+    return unwrap_tool_envelope(payload) if payload else {}
+
+
+def _load_raw_json_object(raw: str) -> dict:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _append_ref(refs: list[str], value) -> None:
+    ref = str(value or "").strip()
+    if ref:
+        refs.append(ref)
+
+
+def _dedupe_refs(refs: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for ref in refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        deduped.append(ref)
+    return deduped
+
+
+def _is_ref_fetched(source_ref: str, fetched_refs: list[str]) -> bool:
+    for fetched in fetched_refs:
+        if source_ref == fetched:
+            return True
+        if "#" not in fetched and source_ref.startswith(fetched + "#"):
+            return True
     return False
+
+
+def _estimate_message_tokens(messages: list[dict]) -> int:
+    total_chars = 0
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+    return max(1, total_chars // 3)

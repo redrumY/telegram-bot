@@ -1,5 +1,8 @@
 """
-记忆检索器：RAG 检索逻辑
+Legacy 记忆检索器：历史 RAG 检索草稿。
+
+生产链路请使用 memory.engine.DefaultMemoryEngine。被动注入和 recall_memory
+都应通过 MemoryEngine 的统一检索 core，避免这里的历史实现与当前策略漂移。
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryRetriever:
-    """记忆检索器：RAG 检索逻辑"""
+    """Legacy compatibility stub; not wired into the current runtime."""
 
     def __init__(self, store: MemoryStore, embedder: "Embedder") -> None:
         self._store = store

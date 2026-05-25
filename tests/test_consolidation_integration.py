@@ -28,7 +28,9 @@ from agent.pipeline.phases.before_reasoning import BeforeReasoningPhase
 from agent.pipeline.phases.before_turn import BeforeTurnPhase, _sessions
 from agent.pipeline.reasoner import Reasoner
 from agent.pipeline.consolidation_worker import ConsolidationWorker
+from memory.bootstrap import build_memory_runtime
 from persistence.database import init_db
+from persistence.session_store import get_session_store
 
 
 class FakeReasoner(Reasoner):
@@ -53,6 +55,11 @@ async def test_consolidation_triggers():
 
     from memory.store import MemoryStore
     store = MemoryStore(mock_embedder)
+    memory_runtime = build_memory_runtime(
+        embedder=mock_embedder,
+        memory_store=store,
+        session_store=get_session_store(),
+    )
 
     # 追踪 consolidation 写入
     upsert_calls = []
@@ -64,9 +71,9 @@ async def test_consolidation_triggers():
 
     store.upsert_item = tracking_upsert
 
-    before_turn = BeforeTurnPhase(mock_embedder, store)
+    before_turn = BeforeTurnPhase(memory_engine=memory_runtime.engine)
     before_reasoning = BeforeReasoningPhase()
-    reasoner = FakeReasoner(store=store, embedder=mock_embedder)
+    reasoner = FakeReasoner()
     after_reasoning = AfterReasoningPhase(store)
     # Mock event bus
     event_bus = MagicMock()
@@ -83,6 +90,7 @@ async def test_consolidation_triggers():
         after_turn=after_turn,
         store=store,
         consolidation_worker=consolidation,
+        memory_runtime=memory_runtime,
     )
 
     # 模拟 consolidation LLM 调用（patch AsyncOpenAI）
@@ -119,6 +127,9 @@ async def test_consolidation_triggers():
     assert session.last_consolidated == 22, (
         f"last_consolidated should be 22, got {session.last_consolidated}"
     )
+    persisted = get_session_store().load_state(1, 1)
+    assert persisted is not None
+    assert persisted[1] == 22
 
     print("test_consolidation_triggers: PASS")
     print(f"  session messages: {len(session.messages)}")
@@ -135,10 +146,15 @@ async def test_consolidation_skips():
 
     from memory.store import MemoryStore
     store = MemoryStore(mock_embedder)
+    memory_runtime = build_memory_runtime(
+        embedder=mock_embedder,
+        memory_store=store,
+        session_store=get_session_store(),
+    )
 
-    before_turn = BeforeTurnPhase(mock_embedder, store)
+    before_turn = BeforeTurnPhase(memory_engine=memory_runtime.engine)
     before_reasoning = BeforeReasoningPhase()
-    reasoner = FakeReasoner(store=store, embedder=mock_embedder)
+    reasoner = FakeReasoner()
     after_reasoning = AfterReasoningPhase(store)
     event_bus = MagicMock()
     event_bus.emit = AsyncMock()
@@ -153,6 +169,7 @@ async def test_consolidation_skips():
         after_turn=after_turn,
         store=store,
         consolidation_worker=consolidation,
+        memory_runtime=memory_runtime,
     )
 
     for i in range(5):

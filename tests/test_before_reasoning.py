@@ -16,6 +16,8 @@ from agent.pipeline.phases.before_reasoning import BeforeReasoningPhase
 from datetime import datetime
 from uuid import uuid4
 
+from memory.markdown_store import MarkdownMemoryStore
+
 
 async def test_preheat():
     """Test preheat is a no-op."""
@@ -65,6 +67,7 @@ async def test_build_ctx_with_memories():
         inbound_message=inbound,
         session=session,
         retrieved_memories=memories,
+        retrieved_memory_block="- 用户喜欢吃苹果\n- 用户喜欢红色",
     )
 
     # Build context
@@ -163,6 +166,106 @@ async def test_benchmark_prompt_requires_memory_tools():
     print("test_benchmark_prompt_requires_memory_tools: PASS")
 
 
+async def test_recent_context_prompt_block_strips_recent_turns():
+    """Test P6 injects only stable RECENT_CONTEXT.md sections."""
+    recent_context = """# Recent Context
+
+## Compression
+- 用户最近在迁移 Akashic 记忆架构。
+
+## Ongoing Threads
+- P6 只注入稳定摘要。
+
+## User State
+- 用户希望保持 eval 链路可比。
+
+## Recent Turns
+<!-- a-preview = assistant reply preview only -->
+[user] 这句不能进入 prompt
+[a-preview] 这句也不能进入 prompt
+"""
+    phase = BeforeReasoningPhase(
+        recent_context_reader=lambda user_id: recent_context,
+    )
+
+    session = Session(user_id=123, chat_id=456, messages=[])
+    inbound = InboundMessage(user_id=123, chat_id=456, content="继续")
+    turn_ctx = BeforeTurnCtx(
+        inbound_message=inbound,
+        session=session,
+        retrieved_memories=[],
+    )
+
+    reasoning_ctx = await phase.build_ctx(turn_ctx)
+    system_prompt = reasoning_ctx.messages[0]["content"]
+    section_names = [section.name for section in reasoning_ctx.prompt_sections]
+
+    assert "recent_context" in section_names
+    assert "## Compression" in system_prompt
+    assert "用户最近在迁移 Akashic 记忆架构" in system_prompt
+    assert "## Ongoing Threads" in system_prompt
+    assert "## User State" in system_prompt
+    assert "## Recent Turns" not in system_prompt
+    assert "这句不能进入 prompt" not in system_prompt
+    assert "这句也不能进入 prompt" not in system_prompt
+    print("test_recent_context_prompt_block_strips_recent_turns: PASS")
+
+
+async def test_memory_profile_prompt_blocks_inject_self_and_memory_only():
+    """Test P8 injects SELF.md and MEMORY.md without pending/history leakage."""
+    with tempfile.TemporaryDirectory() as tmp:
+        markdown = MarkdownMemoryStore(Path(tmp))
+        markdown.write_self(
+            123,
+            "# Self Model\n\n## Persona\n- 稳定、简洁。",
+        )
+        markdown.write_long_term(
+            123,
+            "# Long-term Memory\n\n## User Preferences\n- 用户喜欢拿铁。",
+        )
+        markdown.append_pending_once(
+            user_id=123,
+            items=["- [preference] 这条 pending 不能进入 prompt"],
+            source_ref="session:123:456#msg:0-1",
+        )
+        markdown.append_history_once(
+            user_id=123,
+            entries=["[2026-05-18 10:00] 这条 history 不能进入 prompt"],
+            source_ref="session:123:456#msg:0-1",
+        )
+
+        phase = BeforeReasoningPhase(
+            self_model_reader=markdown.read_self,
+            long_term_memory_reader=markdown.read_long_term,
+            recent_context_reader=markdown.read_recent_context,
+        )
+        session = Session(user_id=123, chat_id=456, messages=[])
+        inbound = InboundMessage(user_id=123, chat_id=456, content="我喜欢喝什么？")
+        turn_ctx = BeforeTurnCtx(
+            inbound_message=inbound,
+            session=session,
+            retrieved_memories=[],
+        )
+
+        reasoning_ctx = await phase.build_ctx(turn_ctx)
+        system_prompt = reasoning_ctx.messages[0]["content"]
+        section_names = [section.name for section in reasoning_ctx.prompt_sections]
+
+        assert section_names[:4] == [
+            "assistant_base",
+            "self_model",
+            "long_term_memory",
+            "recent_context",
+        ]
+        assert "## Self Model" in system_prompt
+        assert "稳定、简洁" in system_prompt
+        assert "## Long-term Memory" in system_prompt
+        assert "用户喜欢拿铁" in system_prompt
+        assert "这条 pending 不能进入 prompt" not in system_prompt
+        assert "这条 history 不能进入 prompt" not in system_prompt
+        print("test_memory_profile_prompt_blocks_inject_self_and_memory_only: PASS")
+
+
 async def test_messages_format_openai():
     """Test messages conform to OpenAI format."""
     phase = BeforeReasoningPhase()
@@ -199,6 +302,8 @@ async def main():
     await test_build_ctx_with_memories()
     await test_build_ctx_no_memories()
     await test_benchmark_prompt_requires_memory_tools()
+    await test_recent_context_prompt_block_strips_recent_turns()
+    await test_memory_profile_prompt_blocks_inject_self_and_memory_only()
     await test_messages_format_openai()
     print("\nAll before_reasoning tests passed!")
 

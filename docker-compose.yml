@@ -5,14 +5,23 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      DATABASE_PATH: /app/data/memory.db
+      HTTP_PROXY: ${BOT_HTTP_PROXY:-http://host.docker.internal:7897}
+      HTTPS_PROXY: ${BOT_HTTPS_PROXY:-http://host.docker.internal:7897}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1}
+      TZ: ${TZ:-Asia/Shanghai}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Persist database across container restarts
       - ./data:/app/data
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "python main.py"]
-      interval: 30s
+      test: ["CMD", "python", "infra/healthcheck_telegram.py"]
+      interval: 60s
       timeout: 10s
       retries: 3
+      start_period: 60s
 
 volumes:
   data:

@@ -4,6 +4,26 @@ from typing import Any
 from uuid import UUID
 
 
+def _empty_str_list() -> list[str]:
+    return []
+
+
+def _empty_metadata() -> dict[str, Any]:
+    return {}
+
+
+def _empty_history() -> tuple[Any, ...]:
+    return ()
+
+
+def _empty_tool_chain() -> tuple[dict[str, Any], ...]:
+    return ()
+
+
+def _empty_prompt_sections() -> list[Any]:
+    return []
+
+
 @dataclass(frozen=True)
 class InboundMessage:
     user_id: int
@@ -52,6 +72,19 @@ class BeforeTurnCtx(PipelineContext):
     inbound_message: InboundMessage
     session: Session
     retrieved_memories: list[MemoryItem]
+    session_key: str = ""
+    channel: str = "telegram"
+    chat_id: str = ""
+    content: str = ""
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    skill_names: list[str] = field(default_factory=_empty_str_list)
+    retrieved_memory_block: str = ""
+    retrieval_trace_raw: object | None = None
+    history_messages: tuple[Any, ...] = field(default_factory=_empty_history)
+    extra_hints: list[str] = field(default_factory=_empty_str_list)
+    extra_metadata: dict[str, Any] = field(default_factory=_empty_metadata)
+    abort: bool = False
+    abort_reply: str = ""
 
 
 @dataclass
@@ -60,6 +93,70 @@ class BeforeReasoningCtx(PipelineContext):
     memories: list[MemoryItem]
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]]
+    session_key: str = ""
+    channel: str = "telegram"
+    chat_id: str = ""
+    content: str = ""
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    skill_names: list[str] = field(default_factory=_empty_str_list)
+    retrieved_memory_block: str = ""
+    extra_hints: list[str] = field(default_factory=_empty_str_list)
+    abort: bool = False
+    abort_reply: str = ""
+    prompt_sections: list[Any] = field(default_factory=_empty_prompt_sections)
+
+
+@dataclass
+class PromptRenderCtx(PipelineContext):
+    session_key: str
+    channel: str
+    chat_id: str
+    user_id: int | None
+    content: str
+    timestamp: datetime
+    history: list[dict[str, Any]]
+    memories: list[MemoryItem]
+    benchmark_mode: bool = False
+    skill_names: list[str] = field(default_factory=_empty_str_list)
+    retrieved_memory_block: str = ""
+    extra_hints: list[str] = field(default_factory=_empty_str_list)
+    system_sections_top: list[Any] = field(default_factory=_empty_prompt_sections)
+    system_sections_bottom: list[Any] = field(default_factory=_empty_prompt_sections)
+
+
+@dataclass(frozen=True)
+class PromptRenderResult:
+    messages: list[dict[str, Any]]
+    system_prompt: str
+    system_sections: list[Any]
+
+
+@dataclass
+class BeforeStepCtx(PipelineContext):
+    session_key: str
+    channel: str
+    chat_id: str
+    iteration: int
+    input_tokens_estimate: int
+    visible_tool_names: frozenset[str] | None
+    extra_hints: list[str] = field(default_factory=_empty_str_list)
+    early_stop: bool = False
+    early_stop_reply: str = ""
+
+
+@dataclass
+class AfterStepCtx(PipelineContext):
+    session_key: str
+    channel: str
+    chat_id: str
+    iteration: int
+    tools_called: tuple[str, ...]
+    partial_reply: str
+    tools_used_so_far: tuple[str, ...]
+    tool_chain_partial: tuple[dict[str, Any], ...]
+    partial_thinking: str | None
+    has_more: bool
+    extra_metadata: dict[str, Any] = field(default_factory=_empty_metadata)
 
 
 @dataclass
@@ -73,6 +170,61 @@ class ReasonerResult:
 class AfterReasoningCtx(PipelineContext):
     reasoner_result: ReasonerResult
     outbound_message: OutboundMessage
+    session_key: str = ""
+    channel: str = "telegram"
+    chat_id: str = ""
+    reply: str = ""
+    thinking: str | None = None
+    tools_used: tuple[str, ...] = field(default_factory=tuple)
+    tool_chain: tuple[dict[str, Any], ...] = field(default_factory=_empty_tool_chain)
+    media: list[str] = field(default_factory=_empty_str_list)
+    outbound_metadata: dict[str, Any] = field(default_factory=_empty_metadata)
+
+
+@dataclass
+class AfterTurnCtx(PipelineContext):
+    session_key: str
+    channel: str
+    chat_id: str
+    reply: str
+    tools_used: tuple[str, ...]
+    thinking: str | None
+    will_dispatch: bool
+    extra_metadata: dict[str, Any] = field(default_factory=_empty_metadata)
+
+
+@dataclass(frozen=True)
+class BeforeToolCallCtx:
+    session_key: str
+    channel: str
+    chat_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AfterToolResultCtx:
+    session_key: str
+    channel: str
+    chat_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    result: str
+    status: str
+
+
+@dataclass
+class PreToolCtx:
+    session_key: str
+    channel: str
+    chat_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    call_id: str = ""
+    source: str = ""
+    request_text: str = ""
+    tool_batch: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    tool_batch_index: int = 0
 
 
 @dataclass

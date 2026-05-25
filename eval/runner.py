@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import logging
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -36,10 +37,14 @@ from agent.pipeline.phases.after_turn import AfterTurnPhase
 from agent.pipeline.phases.before_reasoning import BeforeReasoningPhase
 from agent.pipeline.phases.before_turn import BeforeTurnPhase
 from agent.pipeline.reasoner import Reasoner
+from agent.tool_hooks import ToolExecutor
+from agent.tools import ToolRegistry
+from agent.tools.memory import register_memory_tools
 from config.settings import settings
 from evaluation.dataset_builder import EvalDataset, EvalCase
 from evaluation.metrics import evaluate_single, score_results, format_score_report, token_f1
 from evaluation.seed_memory import seed_from_mock_conversations
+from memory.bootstrap import build_memory_runtime, default_markdown_memory_root
 from memory.embedder import Embedder
 from memory.store import MemoryStore
 from persistence.database import init_db
@@ -66,18 +71,43 @@ class EvalAdapter:
 async def _create_pipeline() -> PassiveTurnPipeline:
     embedder = Embedder()
     store = MemoryStore(embedder)
-    before_turn = BeforeTurnPhase(embedder, store)
-    before_reasoning = BeforeReasoningPhase(benchmark_mode=True)
-    await before_reasoning.preheat()
-    reasoner = Reasoner(store=store, embedder=embedder, session_store=get_session_store())
-    after_reasoning = AfterReasoningPhase(store)
+    session_store = get_session_store()
+    memory_runtime = build_memory_runtime(
+        embedder=embedder,
+        memory_store=store,
+        session_store=session_store,
+    )
     from agent.core.event_bus import EventBus
-    after_turn = AfterTurnPhase(EventBus.get_instance(), EvalAdapter())
+    event_bus = EventBus.get_instance()
+    tool_registry = ToolRegistry()
+    tool_executor = ToolExecutor()
+    register_memory_tools(tool_registry, memory_runtime.engine)
+    before_turn = BeforeTurnPhase(
+        event_bus=event_bus,
+        memory_engine=memory_runtime.engine,
+    )
+    before_reasoning = BeforeReasoningPhase(
+        benchmark_mode=True,
+        tool_registry=tool_registry,
+        event_bus=event_bus,
+        self_model_reader=memory_runtime.markdown.store.read_self,
+        long_term_memory_reader=memory_runtime.markdown.store.read_long_term,
+        recent_context_reader=memory_runtime.markdown.store.read_recent_context,
+    )
+    await before_reasoning.preheat()
+    reasoner = Reasoner(
+        tool_registry=tool_registry,
+        tool_executor=tool_executor,
+        event_bus=event_bus,
+    )
+    after_reasoning = AfterReasoningPhase(store)
+    after_turn = AfterTurnPhase(event_bus, EvalAdapter())
     return PassiveTurnPipeline(
         before_turn=before_turn, before_reasoning=before_reasoning,
         reasoner=reasoner, after_reasoning=after_reasoning, after_turn=after_turn,
         store=store,
         consolidation_worker=None,  # eval 不触发窗口 consolidation（每次 --fresh + 独立 seed）
+        memory_runtime=memory_runtime,
     )
 
 # ── QA instance (with trace capture) ─────────────────────────────────────
@@ -165,6 +195,10 @@ def _clear_memories(store: MemoryStore) -> None:
     conn.execute("DELETE FROM memory_items")
     conn.execute("DELETE FROM vec_items")
     conn.commit()
+    shutil.rmtree(
+        default_markdown_memory_root() / "users" / str(_EVAL_USER_ID),
+        ignore_errors=True,
+    )
 
 
 # ── Trace printer ────────────────────────────────────────────────────────

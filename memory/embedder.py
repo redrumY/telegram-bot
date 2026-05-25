@@ -29,3 +29,6 @@ class Embedder:
                     continue
                 raise
         return []  # unreachable but satisfies type checker
+
+    async def close(self) -> None:
+        await self.client.close()

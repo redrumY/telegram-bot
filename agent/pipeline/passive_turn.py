@@ -27,6 +27,7 @@ class PassiveTurnPipeline:
         store: MemoryStore | None = None,
         consolidation_worker: ConsolidationWorker | None = None,
         invalidation_worker: InvalidationWorker | None = None,
+        memory_runtime: object | None = None,
     ) -> None:
         self.before_turn = before_turn
         self.before_reasoning = before_reasoning
@@ -36,15 +37,30 @@ class PassiveTurnPipeline:
         self._store = store
         self._consolidation = consolidation_worker
         self._invalidation = invalidation_worker
+        self._memory_runtime = memory_runtime
         self._consolidation_inflight: set[tuple[int, int]] = set()
 
     async def execute(self, inbound_message: InboundMessage) -> OutboundMessage:
         """Execute the full pipeline for a single turn."""
         # Phase 1: BeforeTurn - acquire session and retrieve memories
         turn_ctx = await self.before_turn.build_ctx(inbound_message)
+        if turn_ctx.abort:
+            outbound = OutboundMessage(
+                chat_id=inbound_message.chat_id,
+                content=turn_ctx.abort_reply or "",
+            )
+            await self._dispatch_abort(outbound)
+            return outbound
 
         # Phase 2: BeforeReasoning - prepare messages and tools for LLM
         reasoning_ctx = await self.before_reasoning.build_ctx(turn_ctx)
+        if reasoning_ctx.abort:
+            outbound = OutboundMessage(
+                chat_id=inbound_message.chat_id,
+                content=reasoning_ctx.abort_reply or "",
+            )
+            await self._dispatch_abort(outbound)
+            return outbound
 
         # Phase 3: Reasoner - call LLM and handle tool calls
         result = await self.reasoner.run_turn(reasoning_ctx)
@@ -94,18 +110,43 @@ class PassiveTurnPipeline:
             inbound_message.user_id,
             inbound_message.chat_id,
             turn_ctx.session.messages,
+            last_consolidated=turn_ctx.session.last_consolidated,
         )
+        self._refresh_markdown_recent_turns(turn_ctx.session, inbound_message.user_id)
 
         # ── 窗口期 consolidation（对应 akashic on_turn_committed → _enqueue_maintenance）──
         self._maybe_consolidate(turn_ctx.session, inbound_message)
-        self._maybe_invalidate(inbound_message, result)
+        self._maybe_invalidate(inbound_message, result, turn_ctx.session)
 
         return after_ctx.outbound_message
 
-    def _maybe_invalidate(self, inbound_message: InboundMessage, result) -> None:
+    def _refresh_markdown_recent_turns(self, session, user_id: int) -> None:
+        runtime = self._memory_runtime
+        markdown = getattr(runtime, "markdown", None)
+        store = getattr(markdown, "store", None)
+        if store is None:
+            return
+        try:
+            store.write_recent_turns(
+                user_id=user_id,
+                messages=session.messages,
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Markdown recent turns refresh failed user=%d",
+                user_id,
+            )
+
+    def _maybe_invalidate(self, inbound_message: InboundMessage, result, session) -> None:
         """Run akashic-style post-response invalidation asynchronously."""
         if self._invalidation is None:
             return
+        current_source_ref = _source_ref_for_last_turn(
+            inbound_message.user_id,
+            inbound_message.chat_id,
+            len(session.messages),
+        )
 
         async def _run():
             try:
@@ -115,7 +156,7 @@ class PassiveTurnPipeline:
                     tool_calls=result.tool_calls,
                     user_id=inbound_message.user_id,
                     chat_id=inbound_message.chat_id,
-                    source_ref=f"session:{inbound_message.user_id}:{inbound_message.chat_id}",
+                    source_ref=current_source_ref,
                 )
             except Exception:
                 import logging
@@ -126,6 +167,11 @@ class PassiveTurnPipeline:
                 )
 
         asyncio.create_task(_run())
+
+    async def _dispatch_abort(self, outbound: OutboundMessage) -> None:
+        adapter = getattr(self.after_turn, "telegram_adapter", None)
+        if adapter is not None:
+            await adapter.send(outbound)
 
     def _maybe_consolidate(
         self,
@@ -159,6 +205,13 @@ class PassiveTurnPipeline:
                     user_id=user_id,
                     chat_id=chat_id,
                 )
+                from persistence.session_store import get_session_store
+                get_session_store().save(
+                    user_id,
+                    chat_id,
+                    session.messages,
+                    last_consolidated=session.last_consolidated,
+                )
             except Exception:
                 import logging
                 logging.getLogger(__name__).exception(
@@ -168,3 +221,9 @@ class PassiveTurnPipeline:
                 self._consolidation_inflight.discard(session_key)
 
         asyncio.create_task(_run())
+
+
+def _source_ref_for_last_turn(user_id: int, chat_id: int, message_count: int) -> str:
+    if message_count >= 2:
+        return f"session:{user_id}:{chat_id}#msg:{message_count - 2}-{message_count - 1}"
+    return f"session:{user_id}:{chat_id}"

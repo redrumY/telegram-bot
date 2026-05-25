@@ -8,8 +8,9 @@ akashic 模式：
   sm.save(session)                 # 持久化到 SQLite
 
 对应我们：
-  SessionStore.save(key, messages)  # 存储消息列表
-  SessionStore.load(key)            # 加载消息列表
+  SessionStore.save(key, messages, last_consolidated=...)
+  SessionStore.load_state(key)      # 加载消息列表 + consolidation 游标
+  SessionStore.load(key)            # 兼容旧调用：只加载消息列表
   _sessions dict 作为内存缓存（对齐 akashic _cache）
 """
 
@@ -25,41 +26,74 @@ logger = logging.getLogger(__name__)
 
 
 class SessionStore:
-    """会话持久化存储，用 SQLite 存消息 JSON"""
+    """会话持久化存储，用 SQLite 存消息 JSON 和 consolidation 游标。"""
 
-    def save(self, user_id: int, chat_id: int, messages: list[dict[str, Any]]) -> None:
-        """保存会话消息到数据库（INSERT OR REPLACE）
+    def save(
+        self,
+        user_id: int,
+        chat_id: int,
+        messages: list[dict[str, Any]],
+        *,
+        last_consolidated: int | None = None,
+    ) -> None:
+        """保存会话消息和 consolidation 游标到数据库（upsert）
 
         Args:
             user_id: 用户 ID
             chat_id: 聊天 ID
             messages: 消息列表 [{\"role\": ..., \"content\": ...}, ...]
+            last_consolidated: 已完成 consolidation 的消息下标游标；未传则保留已有游标
         """
         conn = get_connection()
+        cursor = int(last_consolidated) if last_consolidated is not None else None
         conn.execute(
             """
-            INSERT OR REPLACE INTO conversation_sessions
-                (user_id, chat_id, messages_json, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO conversation_sessions
+                (user_id, chat_id, messages_json, last_consolidated, updated_at)
+            VALUES (?, ?, ?, COALESCE(?, 0), CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, chat_id) DO UPDATE SET
+                messages_json = excluded.messages_json,
+                last_consolidated = COALESCE(?, conversation_sessions.last_consolidated),
+                updated_at = CURRENT_TIMESTAMP
             """,
-            (user_id, chat_id, json.dumps(messages, ensure_ascii=False)),
+            (
+                user_id,
+                chat_id,
+                json.dumps(messages, ensure_ascii=False),
+                cursor,
+                cursor,
+            ),
         )
         conn.commit()
-        logger.debug("Session saved: user=%d chat=%d messages=%d", user_id, chat_id, len(messages))
+        logger.debug(
+            "Session saved: user=%d chat=%d messages=%d last_consolidated=%s",
+            user_id,
+            chat_id,
+            len(messages),
+            str(cursor) if cursor is not None else "preserve",
+        )
 
-    def load(self, user_id: int, chat_id: int) -> list[dict[str, Any]] | None:
-        """从数据库加载会话消息
+    def load_state(
+        self,
+        user_id: int,
+        chat_id: int,
+    ) -> tuple[list[dict[str, Any]], int] | None:
+        """从数据库加载会话消息和 consolidation 游标。
 
         Args:
             user_id: 用户 ID
             chat_id: 聊天 ID
 
         Returns:
-            消息列表，如果不存在返回 None
+            (消息列表, last_consolidated)，如果不存在返回 None
         """
         conn = get_connection()
         row = conn.execute(
-            "SELECT messages_json FROM conversation_sessions WHERE user_id = ? AND chat_id = ?",
+            """
+            SELECT messages_json, last_consolidated
+            FROM conversation_sessions
+            WHERE user_id = ? AND chat_id = ?
+            """,
             (user_id, chat_id),
         ).fetchone()
 
@@ -68,11 +102,23 @@ class SessionStore:
 
         try:
             messages = json.loads(row[0])
-            logger.debug("Session loaded: user=%d chat=%d messages=%d", user_id, chat_id, len(messages))
-            return messages
+            last_consolidated = int(row[1] or 0)
+            logger.debug(
+                "Session loaded: user=%d chat=%d messages=%d last_consolidated=%d",
+                user_id, chat_id, len(messages), last_consolidated,
+            )
+            return messages, last_consolidated
         except json.JSONDecodeError as e:
             logger.warning("Failed to parse session JSON for user=%d chat=%d: %s", user_id, chat_id, e)
             return None
+
+    def load(self, user_id: int, chat_id: int) -> list[dict[str, Any]] | None:
+        """从数据库加载会话消息，兼容旧调用。"""
+        state = self.load_state(user_id, chat_id)
+        if state is None:
+            return None
+        messages, _last_consolidated = state
+        return messages
 
     def fetch_messages(
         self,

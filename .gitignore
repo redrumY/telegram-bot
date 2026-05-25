@@ -18,7 +18,10 @@ venv/
 *.swo
 
 # Database
-data/
+data/*
+!data/evaluation/
+data/evaluation/*
+!data/evaluation/retrieval_strategy_lab.jsonl
 *.db
 
 # OS
@@ -27,3 +30,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Runtime
+.bot.pid

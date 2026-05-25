@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("test")
 
-from agent.core.types import InboundMessage
+from agent.core.types import BeforeReasoningCtx, InboundMessage, Session
 from agent.pipeline.passive_turn import PassiveTurnPipeline
 from agent.pipeline.phases.after_reasoning import AfterReasoningPhase
 from agent.pipeline.phases.after_turn import AfterTurnPhase
@@ -25,7 +25,11 @@ from agent.pipeline.phases.before_reasoning import BeforeReasoningPhase
 from agent.pipeline.phases.before_turn import BeforeTurnPhase, _sessions
 from agent.pipeline.reasoner import Reasoner
 from agent.pipeline.consolidation_worker import ConsolidationWorker
+from agent.tool_hooks import ToolExecutor
+from agent.tools import ToolRegistry
+from agent.tools.memory import register_memory_tools
 from config.settings import settings
+from memory.bootstrap import build_memory_runtime
 from memory.embedder import Embedder
 from memory.store import MemoryStore
 from persistence.database import get_connection, init_db
@@ -56,15 +60,37 @@ async def main():
     # 创建真实组件
     embedder = Embedder()
     store = MemoryStore(embedder)
+    session_store = get_session_store()
+    memory_runtime = build_memory_runtime(
+        embedder=embedder,
+        memory_store=store,
+        session_store=session_store,
+    )
     event_bus = EventBus.get_instance()
+    tool_registry = ToolRegistry()
+    tool_executor = ToolExecutor()
+    register_memory_tools(tool_registry, memory_runtime.engine)
 
-    before_turn = BeforeTurnPhase(embedder, store)
-    before_reasoning = BeforeReasoningPhase()
-    reasoner = Reasoner(store=store, embedder=embedder, session_store=get_session_store())
+    before_turn = BeforeTurnPhase(memory_engine=memory_runtime.engine)
+    before_reasoning = BeforeReasoningPhase(
+        tool_registry=tool_registry,
+        self_model_reader=memory_runtime.markdown.store.read_self,
+        long_term_memory_reader=memory_runtime.markdown.store.read_long_term,
+        recent_context_reader=memory_runtime.markdown.store.read_recent_context,
+    )
+    reasoner = Reasoner(
+        tool_registry=tool_registry,
+        tool_executor=tool_executor,
+        event_bus=event_bus,
+    )
     after_reasoning = AfterReasoningPhase(store)
     after_turn = AfterTurnPhase(event_bus, None)
 
-    consolidation = ConsolidationWorker(keep_count=10, min_new_messages=6)
+    consolidation = ConsolidationWorker(
+        keep_count=10,
+        min_new_messages=6,
+        markdown_store=memory_runtime.markdown.store,
+    )
 
     pipeline = PassiveTurnPipeline(
         before_turn=before_turn,
@@ -74,6 +100,7 @@ async def main():
         after_turn=after_turn,
         store=store,
         consolidation_worker=consolidation,
+        memory_runtime=memory_runtime,
     )
 
     # 模拟 18 轮对话（每轮 user + assistant = 2条，总共 36条）
@@ -154,12 +181,21 @@ async def main():
     # 额外验证：手动调一次 recall 看能不能搜到
     print(f"\n手动检索测试...")
     import json
-    r = Reasoner(store=store, embedder=embedder, session_store=get_session_store())
-    recall_result = await r._recall_memory({
-        "query": "用户的职业是什么",
-        "user_id": TEST_USER_ID,
-        "limit": 5,
-    })
+    recall_ctx = BeforeReasoningCtx(
+        session=Session(user_id=TEST_USER_ID, chat_id=TEST_CHAT_ID, messages=[]),
+        memories=[],
+        messages=[],
+        tools=tool_registry.get_schemas(),
+    )
+    recall_result = await tool_registry.execute(
+        "recall_memory",
+        {
+            "query": "用户的职业是什么",
+            "user_id": TEST_USER_ID,
+            "limit": 5,
+        },
+        recall_ctx,
+    )
     print(f"recall_memory('用户的职业是什么'):")
     import json
     parsed = json.loads(recall_result)

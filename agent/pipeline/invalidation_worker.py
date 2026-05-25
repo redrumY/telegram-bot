@@ -50,6 +50,9 @@ class InvalidationWorker:
         )
         self._model = model or settings.LLM_MODEL
 
+    async def close(self) -> None:
+        await self._client.close()
+
     async def run(
         self,
         *,
@@ -76,6 +79,7 @@ class InvalidationWorker:
                 topic=topic,
                 user_id=user_id,
                 protected_ids=protected_ids,
+                current_source_ref=source_ref,
             )
             if not candidates:
                 continue
@@ -138,6 +142,7 @@ class InvalidationWorker:
         topic: str,
         user_id: int,
         protected_ids: set[str],
+        current_source_ref: str,
     ) -> list[dict[str, str]]:
         query_vec = await self._embedder.embed(topic)
         vec_results = await self._store.vector_search(
@@ -157,6 +162,8 @@ class InvalidationWorker:
         for mem in [*vec_results, *keyword_results]:
             item_id = str(mem.id)
             if item_id in seen or item_id in protected_ids:
+                continue
+            if _same_exact_message_window(mem.source_ref or "", current_source_ref):
                 continue
             if mem.memory_type not in self.STRUCTURED_MEMORY_TYPES:
                 continue
@@ -185,17 +192,17 @@ class InvalidationWorker:
         if not ok:
             return [], token_budget
 
-        prompt = f"""判断用户消息是否在明确纠正、否定或废弃一条旧记忆。
+        prompt = f"""判断用户消息是否在明确纠正、否定、废弃或更新一条旧记忆。
 
 用户消息：{user_msg}
 
 【必须同时满足才触发】
-1. 用户表达了明确的否定/纠错/废弃意图，例如“不对/不是/错了/记错了/其实/改成/忘掉/不要再/过时/删除”
-2. 被否定对象是关于用户偏好、身份、事实、事件或 agent 操作流程的旧记忆
+1. 用户表达了明确的否定/纠错/废弃/更新意图，例如“不对/不是/错了/记错了/其实/改成/改为/换成/迁到/更新一下/流程更新/以后/忘掉/不要再/过时/删除”
+2. 新说法会替代一条关于用户偏好、身份、事实、事件或 agent 操作流程的旧记忆
 
 【以下情况返回 []】
 - 用户只是在提问或确认
-- 用户只是在表达普通否定句，但没有纠正旧记忆
+- 用户只是在表达普通否定句或普通新事实，但没有替代旧记忆
 - 用户语气不确定，例如“也许/可能/我猜”
 - 否定对象是第三方事实，且和用户/agent 记忆无关
 
@@ -203,6 +210,7 @@ class InvalidationWorker:
 例：
 - “不对，我喜欢茶” -> ["用户的饮品偏好"]
 - “你记错了，我不住北京了，现在在上海” -> ["用户居住地"]
+- “流程更新：仓库迁到 pnpm 了，以后提交前跑 pnpm test” -> ["仓库提交前测试流程"]
 - “以后不要再用 web_search 查 Steam 了” -> ["Steam 查询流程"]
 
 只返回 JSON 数组，如 ["用户的饮品偏好"] 或 []。"""
@@ -239,7 +247,7 @@ class InvalidationWorker:
             f"- id={c['id']} | type={c['memory_type']} | {c['summary']}"
             for c in candidates
         )
-        prompt = f"""用户本轮明确纠正/否定了旧记忆主题：“{topic}”。
+        prompt = f"""用户本轮明确纠正/否定/更新了旧记忆主题：“{topic}”。
 
 用户原话：
 {user_msg}
@@ -292,3 +300,13 @@ def _loads_json_array(text: str) -> list[str]:
         if isinstance(item, str) and item.strip():
             result.append(item.strip())
     return result
+
+
+def _same_exact_message_window(left: str, right: str) -> bool:
+    left_ref = str(left or "").strip()
+    right_ref = str(right or "").strip()
+    if not left_ref or not right_ref:
+        return False
+    if "#msg:" not in left_ref or "#msg:" not in right_ref:
+        return False
+    return left_ref == right_ref
