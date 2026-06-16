@@ -99,7 +99,7 @@ async function loadHistory() {
 
 async function sendMessage(content) {
   appendMessage("user", content);
-  setBusy(true);
+  setBusy(true, "queued");
   nodes.traceText.textContent = "request accepted";
   try {
     const response = await fetch("/api/chat", {
@@ -115,14 +115,37 @@ async function sendMessage(content) {
       throw new Error(`HTTP ${response.status}`);
     }
     const data = await response.json();
-    appendMessage("assistant", data.answer || "");
-    nodes.traceText.textContent = "done";
+    await waitForTurn(data.turn_id);
   } catch (error) {
     appendMessage("assistant", "请求失败，请稍后重试。");
     nodes.traceText.textContent = error instanceof Error ? error.message : "failed";
   } finally {
     setBusy(false);
     nodes.input.focus();
+  }
+}
+
+async function waitForTurn(turnId) {
+  if (!turnId || turnId === "inline") {
+    return;
+  }
+  for (;;) {
+    const response = await fetch(`/api/turns/${turnId}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const data = await response.json();
+    setBusy(true, data.status || "processing");
+    nodes.traceText.textContent = data.status || "processing";
+    if (data.status === "done") {
+      appendMessage("assistant", data.answer || "");
+      nodes.traceText.textContent = "done";
+      return;
+    }
+    if (data.status === "failed") {
+      throw new Error(data.error || "turn failed");
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 750));
   }
 }
 

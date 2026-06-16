@@ -13,10 +13,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from agent.service import AgentService, ChatResult
+from agent.service import AgentService
 
 if TYPE_CHECKING:
     from agent.runtime import AgentRuntime
+    from agent.service import ChatResult
+    from persistence.turn_store import Turn
 
 
 class HealthResponse(BaseModel):
@@ -33,7 +35,10 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     user_id: int
     session_id: int
-    answer: str
+    turn_id: str
+    status: str
+    answer: str | None = None
+    error: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -43,22 +48,40 @@ class MessageListResponse(BaseModel):
     messages: list[dict[str, Any]]
 
 
-def _chat_response(result: ChatResult) -> ChatResponse:
+def _chat_response(result: "ChatResult") -> ChatResponse:
     return ChatResponse(
         user_id=result.user_id,
         session_id=result.session_id,
+        turn_id="inline",
+        status="done",
         answer=result.answer,
         metadata=result.metadata,
     )
 
 
 SessionReader = Callable[[int, int], list[dict[str, Any]]]
+TurnCreator = Callable[[int, int, str, dict[str, Any] | None], "Turn"]
+TurnReader = Callable[[str], "Turn | None"]
+
+
+def _turn_response(turn: Any) -> ChatResponse:
+    return ChatResponse(
+        user_id=turn.user_id,
+        session_id=turn.session_id,
+        turn_id=turn.id,
+        status=turn.status,
+        answer=turn.answer,
+        error=turn.error,
+        metadata=turn.metadata,
+    )
 
 
 def create_app(
     service: AgentService | None = None,
     *,
     session_reader: SessionReader | None = None,
+    turn_creator: TurnCreator | None = None,
+    turn_reader: TurnReader | None = None,
 ) -> FastAPI:
     """Create the Web API.
 
@@ -101,18 +124,32 @@ def create_app(
 
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(payload: ChatRequest) -> ChatResponse:
-        agent_service: AgentService | None = getattr(app.state, "agent_service", None)
-        if agent_service is None:
-            raise HTTPException(status_code=503, detail="Agent service is not ready")
         session_id = payload.session_id if payload.session_id is not None else payload.user_id
-        result = await agent_service.chat(
-            user_id=payload.user_id,
-            session_id=session_id,
-            content=payload.message,
-            channel="web",
-            metadata=payload.metadata,
-        )
-        return _chat_response(result)
+        metadata = {"channel": "web", **(payload.metadata or {})}
+        if turn_creator is None:
+            from persistence.turn_store import get_turn_store
+
+            turn = get_turn_store().create_turn(
+                user_id=payload.user_id,
+                session_id=session_id,
+                content=payload.message,
+                metadata=metadata,
+            )
+        else:
+            turn = turn_creator(payload.user_id, session_id, payload.message, metadata)
+        return _turn_response(turn)
+
+    @app.get("/api/turns/{turn_id}", response_model=ChatResponse)
+    async def get_turn(turn_id: str) -> ChatResponse:
+        if turn_reader is None:
+            from persistence.turn_store import get_turn_store
+
+            turn = get_turn_store().get_turn(turn_id)
+        else:
+            turn = turn_reader(turn_id)
+        if turn is None:
+            raise HTTPException(status_code=404, detail="Turn not found")
+        return _turn_response(turn)
 
     @app.get("/api/sessions/{session_id}/messages", response_model=MessageListResponse)
     async def session_messages(

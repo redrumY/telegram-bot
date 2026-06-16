@@ -49,6 +49,29 @@ CREATE TABLE IF NOT EXISTS conversation_sessions (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, chat_id)
 );
+
+-- Web/API turn queue. Each row is one user message waiting for agent execution.
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    session_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    answer TEXT,
+    error TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    finished_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_turns_status_created
+    ON conversation_turns (status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_turns_session_status
+    ON conversation_turns (user_id, session_id, status, created_at);
 """
 
 
@@ -63,6 +86,24 @@ def _ensure_conversation_session_columns(conn: sqlite3.Connection) -> None:
         )
 
 
+def _ensure_conversation_turn_columns(conn: sqlite3.Connection) -> None:
+    """Apply lightweight migrations for existing conversation_turns tables."""
+    rows = conn.execute("PRAGMA table_info(conversation_turns)").fetchall()
+    existing = {str(row[1]) for row in rows}
+    if not existing:
+        return
+    if "metadata_json" not in existing:
+        conn.execute(
+            "ALTER TABLE conversation_turns "
+            "ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    if "attempts" not in existing:
+        conn.execute(
+            "ALTER TABLE conversation_turns "
+            "ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def init_db() -> None:
     """Initialize database with schema."""
     db_path = Path(settings.DATABASE_PATH)
@@ -74,6 +115,7 @@ def init_db() -> None:
     conn.enable_load_extension(False)
     conn.executescript(TABLE_SCHEMA)
     _ensure_conversation_session_columns(conn)
+    _ensure_conversation_turn_columns(conn)
     conn.commit()
     conn.close()
 

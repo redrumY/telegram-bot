@@ -35,6 +35,18 @@
    python main.py
    ```
 
+### Web API + Worker
+
+本地 Web 入口会把用户消息写入 `conversation_turns` 队列，worker 负责消费并调用同一套
+`PassiveTurnPipeline`：
+
+```bash
+uvicorn web_backend.main:app --host 127.0.0.1 --port 8000
+python -m worker.main
+```
+
+打开 http://127.0.0.1:8000 即可使用最小 Web Chat。
+
 ### Docker 部署
 
 ```bash
