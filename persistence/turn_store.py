@@ -208,5 +208,12 @@ _turn_store: TurnStore | None = None
 def get_turn_store() -> TurnStore:
     global _turn_store
     if _turn_store is None:
-        _turn_store = TurnStore()
+        from config.settings import settings
+
+        if settings.TURN_STORE_BACKEND.lower() == "postgres":
+            from persistence.postgres_turn_store import PostgresTurnStore
+
+            _turn_store = PostgresTurnStore()  # type: ignore[assignment]
+        else:
+            _turn_store = TurnStore()
     return _turn_store

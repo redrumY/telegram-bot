@@ -35,17 +35,32 @@
    python main.py
    ```
 
-### Web API + Worker
+### Web API + Worker（PostgreSQL + pgvector）
 
-本地 Web 入口会把用户消息写入 `conversation_turns` 队列，worker 负责消费并调用同一套
-`PassiveTurnPipeline`：
+100-200 同时在线版本使用 PostgreSQL + pgvector 存可靠状态：
+
+- `conversation_turns`: pending / processing / done / failed 队列
+- `conversation_sessions` / `conversation_messages`: 会话与消息持久化预留
+- `memory_items.embedding vector(1024)`: pgvector 长期记忆表
+
+本地单机启动：
 
 ```bash
-uvicorn web_backend.main:app --host 127.0.0.1 --port 8000
-python -m worker.main
+docker compose up postgres api worker
 ```
 
 打开 http://127.0.0.1:8000 即可使用最小 Web Chat。
+
+不使用 Docker 时，先准备 pgvector 数据库，然后配置：
+
+```bash
+export POSTGRES_DSN=postgresql://telegram_bot:telegram_bot@localhost:5432/telegram_bot
+export TURN_STORE_BACKEND=postgres
+export SESSION_STORE_BACKEND=postgres
+export MEMORY_STORE_BACKEND=postgres
+uvicorn web_backend.main:app --host 127.0.0.1 --port 8000
+python -m worker.main
+```
 
 ### Docker 部署
 

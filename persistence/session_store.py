@@ -259,5 +259,215 @@ def get_session_store() -> SessionStore:
     """获取 SessionStore 单例"""
     global _session_store
     if _session_store is None:
-        _session_store = SessionStore()
+        from config.settings import settings
+
+        if settings.SESSION_STORE_BACKEND.lower() == "postgres":
+            _session_store = PostgresSessionStore()  # type: ignore[assignment]
+        else:
+            _session_store = SessionStore()
     return _session_store
+
+
+class PostgresSessionStore:
+    """PostgreSQL-backed session store with the same public API as SessionStore."""
+
+    def __init__(self) -> None:
+        from persistence.postgres import get_postgres_pool, init_postgres
+
+        init_postgres()
+        self.pool = get_postgres_pool()
+
+    def save(
+        self,
+        user_id: int,
+        chat_id: int,
+        messages: list[dict[str, Any]],
+        *,
+        last_consolidated: int | None = None,
+    ) -> None:
+        import json
+
+        cursor_value = int(last_consolidated) if last_consolidated is not None else None
+        payload = json.dumps(messages, ensure_ascii=False)
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO conversation_sessions
+                        (user_id, chat_id, messages_json, last_consolidated, updated_at)
+                    VALUES (%s, %s, %s::jsonb, COALESCE(%s, 0), now())
+                    ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                        messages_json = EXCLUDED.messages_json,
+                        last_consolidated = COALESCE(%s, conversation_sessions.last_consolidated),
+                        updated_at = now()
+                    """,
+                    (user_id, chat_id, payload, cursor_value, cursor_value),
+                )
+                self._replace_messages(cur, user_id, chat_id, messages)
+            conn.commit()
+
+    def load_state(
+        self,
+        user_id: int,
+        chat_id: int,
+    ) -> tuple[list[dict[str, Any]], int] | None:
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT messages_json, last_consolidated
+                    FROM conversation_sessions
+                    WHERE user_id = %s AND chat_id = %s
+                    """,
+                    (user_id, chat_id),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        messages = row["messages_json"] or []
+        if isinstance(messages, str):
+            import json
+
+            messages = json.loads(messages)
+        return list(messages), int(row["last_consolidated"] or 0)
+
+    def load(self, user_id: int, chat_id: int) -> list[dict[str, Any]] | None:
+        state = self.load_state(user_id, chat_id)
+        if state is None:
+            return None
+        messages, _last_consolidated = state
+        return messages
+
+    def fetch_messages(
+        self,
+        user_id: int,
+        chat_id: int,
+        *,
+        seq: int | None = None,
+        seq_end: int | None = None,
+        context: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        messages = self.load(user_id, chat_id) or []
+        if not messages:
+            return [], 0
+        if seq is None:
+            selected = messages[-max(1, int(limit)) :]
+            start = len(messages) - len(selected)
+        else:
+            ctx = max(0, int(context))
+            ref_start = int(seq)
+            ref_end = int(seq_end) if seq_end is not None else ref_start
+            if ref_end < ref_start:
+                ref_start, ref_end = ref_end, ref_start
+            start = max(0, ref_start - ctx)
+            end = min(len(messages), ref_end + ctx + 1)
+            selected = messages[start:end]
+        result = []
+        for offset, message in enumerate(selected):
+            actual_seq = start + offset
+            result.append(
+                {
+                    "role": str(message.get("role") or ""),
+                    "content": str(message.get("content") or ""),
+                    "seq": actual_seq,
+                    "source_ref": f"session:{user_id}:{chat_id}#msg:{actual_seq}",
+                    "in_source_ref": (
+                        seq is not None
+                        and int(seq) <= actual_seq <= int(seq_end if seq_end is not None else seq)
+                    ),
+                }
+            )
+        if seq is not None:
+            ref_end = int(seq_end) if seq_end is not None else int(seq)
+            low = min(int(seq), ref_end)
+            high = max(int(seq), ref_end)
+            matched = max(0, min(high, len(messages) - 1) - max(low, 0) + 1)
+        else:
+            matched = len(result)
+        return result, matched
+
+    def search_messages(
+        self,
+        query: str,
+        *,
+        user_id: int,
+        role: str | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        term = (query or "").strip()
+        if not term:
+            return [], 0
+        params: list[Any] = [user_id, f"%{term}%"]
+        role_clause = ""
+        if role:
+            role_clause = "AND role = %s"
+            params.append(role)
+        params.extend([max(1, min(int(limit), 50)), max(0, int(offset))])
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT user_id, session_id AS chat_id, seq, role, content
+                    FROM conversation_messages
+                    WHERE user_id = %s
+                      AND content ILIKE %s
+                      {role_clause}
+                    ORDER BY id DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+        matches = [
+            {
+                "role": row["role"],
+                "content": row["content"],
+                "seq": int(row["seq"]),
+                "chat_id": int(row["chat_id"]),
+                "source_ref": f"session:{user_id}:{int(row['chat_id'])}#msg:{int(row['seq'])}",
+            }
+            for row in rows
+        ]
+        return matches, len(matches)
+
+    def delete(self, user_id: int, chat_id: int) -> None:
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM conversation_messages WHERE user_id = %s AND session_id = %s",
+                    (user_id, chat_id),
+                )
+                cur.execute(
+                    "DELETE FROM conversation_sessions WHERE user_id = %s AND chat_id = %s",
+                    (user_id, chat_id),
+                )
+            conn.commit()
+
+    def _replace_messages(self, cur: Any, user_id: int, chat_id: int, messages: list[dict[str, Any]]) -> None:
+        import json
+
+        cur.execute(
+            "DELETE FROM conversation_messages WHERE user_id = %s AND session_id = %s",
+            (user_id, chat_id),
+        )
+        for seq, message in enumerate(messages):
+            cur.execute(
+                """
+                INSERT INTO conversation_messages
+                    (user_id, session_id, seq, role, content, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    user_id,
+                    chat_id,
+                    seq,
+                    str(message.get("role") or ""),
+                    str(message.get("content") or ""),
+                    json.dumps(
+                        {k: v for k, v in message.items() if k not in {"role", "content"}},
+                        ensure_ascii=False,
+                    ),
+                ),
+            )

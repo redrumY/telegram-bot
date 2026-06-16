@@ -7,6 +7,7 @@ import logging
 
 from agent.runtime import AgentRuntime
 from agent.service import AgentService
+from config.settings import settings
 from worker.turn_worker import TurnWorker
 
 logging.basicConfig(
@@ -19,9 +20,14 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 async def main() -> None:
     runtime = await AgentRuntime.create()
-    worker = TurnWorker(service=AgentService(runtime.pipeline))
+    service = AgentService(runtime.pipeline)
+    concurrency = max(1, int(settings.WORKER_CONCURRENCY))
+    workers = [
+        TurnWorker(service=service)
+        for _ in range(concurrency)
+    ]
     try:
-        await worker.run_forever()
+        await asyncio.gather(*(worker.run_forever() for worker in workers))
     finally:
         await runtime.shutdown()
 

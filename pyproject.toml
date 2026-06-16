@@ -17,6 +17,7 @@ pydantic-settings = "^2.0"
 langsmith = "^0.8.5"
 fastapi = "^0.115"
 uvicorn = {extras = ["standard"], version = "^0.34"}
+psycopg = {extras = ["binary", "pool"], version = "^3.2"}
 
 [build-system]
 requires = ["poetry-core"]

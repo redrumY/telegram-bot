@@ -1,4 +1,76 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: telegram-bot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-telegram_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-telegram_bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-telegram_bot}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-telegram_bot} -d ${POSTGRES_DB:-telegram_bot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["uvicorn", "web_backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://telegram_bot:telegram_bot@postgres:5432/telegram_bot}
+      TURN_STORE_BACKEND: ${TURN_STORE_BACKEND:-postgres}
+      SESSION_STORE_BACKEND: ${SESSION_STORE_BACKEND:-postgres}
+      MEMORY_STORE_BACKEND: ${MEMORY_STORE_BACKEND:-postgres}
+      DATABASE_PATH: /app/data/memory.db
+      HTTP_PROXY: ${BOT_HTTP_PROXY:-http://host.docker.internal:7897}
+      HTTPS_PROXY: ${BOT_HTTPS_PROXY:-http://host.docker.internal:7897}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1,postgres}
+      TZ: ${TZ:-Asia/Shanghai}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+
+  worker:
+    build: .
+    container_name: telegram-bot-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["python", "-m", "worker.main"]
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://telegram_bot:telegram_bot@postgres:5432/telegram_bot}
+      TURN_STORE_BACKEND: ${TURN_STORE_BACKEND:-postgres}
+      SESSION_STORE_BACKEND: ${SESSION_STORE_BACKEND:-postgres}
+      MEMORY_STORE_BACKEND: ${MEMORY_STORE_BACKEND:-postgres}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      DATABASE_PATH: /app/data/memory.db
+      HTTP_PROXY: ${BOT_HTTP_PROXY:-http://host.docker.internal:7897}
+      HTTPS_PROXY: ${BOT_HTTPS_PROXY:-http://host.docker.internal:7897}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1,postgres}
+      TZ: ${TZ:-Asia/Shanghai}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+
   bot:
     build: .
     container_name: telegram-bot
@@ -7,10 +79,17 @@ services:
       - .env
     environment:
       DATABASE_PATH: /app/data/memory.db
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://telegram_bot:telegram_bot@postgres:5432/telegram_bot}
+      TURN_STORE_BACKEND: ${TURN_STORE_BACKEND:-postgres}
+      SESSION_STORE_BACKEND: ${SESSION_STORE_BACKEND:-postgres}
+      MEMORY_STORE_BACKEND: ${MEMORY_STORE_BACKEND:-postgres}
       HTTP_PROXY: ${BOT_HTTP_PROXY:-http://host.docker.internal:7897}
       HTTPS_PROXY: ${BOT_HTTPS_PROXY:-http://host.docker.internal:7897}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1,postgres}
       TZ: ${TZ:-Asia/Shanghai}
+    depends_on:
+      postgres:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -25,4 +104,6 @@ services:
 
 volumes:
   data:
+    driver: local
+  postgres-data:
     driver: local

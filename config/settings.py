@@ -19,6 +19,11 @@ class Settings(BaseSettings):
 
     # Database
     DATABASE_PATH: str = "./data/memory.db"
+    POSTGRES_DSN: str = "postgresql://telegram_bot:telegram_bot@localhost:5432/telegram_bot"
+    TURN_STORE_BACKEND: str = "postgres"
+    SESSION_STORE_BACKEND: str = "sqlite"
+    MEMORY_STORE_BACKEND: str = "sqlite"
+    WORKER_CONCURRENCY: int = 4
 
     # Proxy (for Telegram API in China)
     HTTP_PROXY: str | None = None

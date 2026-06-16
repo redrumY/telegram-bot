@@ -24,6 +24,7 @@ from memory.embedder import Embedder
 from memory.store import MemoryStore
 from persistence.database import init_db
 from persistence.session_store import get_session_store
+from config.settings import settings
 
 
 class AgentRuntime:
@@ -55,7 +56,12 @@ class AgentRuntime:
         init_db()
 
         embedder = Embedder()
-        memory_store = MemoryStore(embedder)
+        if settings.MEMORY_STORE_BACKEND.lower() == "postgres":
+            from memory.postgres_store import PostgresMemoryStore
+
+            memory_store = PostgresMemoryStore(embedder)
+        else:
+            memory_store = MemoryStore(embedder)
         session_store = get_session_store()
         memory_runtime = build_memory_runtime(
             embedder=embedder,
