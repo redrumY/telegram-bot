@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     # Telegram Bot
-    TG_BOT_TOKEN: str
+    TG_BOT_TOKEN: str = ""
 
     # DeepSeek LLM
     DEEPSEEK_API_KEY: str
