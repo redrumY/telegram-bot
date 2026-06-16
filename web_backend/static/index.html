@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Chat</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="chat-pane" aria-label="对话">
+        <header class="topbar">
+          <div>
+            <h1>Agent Chat</h1>
+            <p id="sessionLabel">session</p>
+          </div>
+          <button id="newSessionButton" class="icon-button" type="button" title="新会话" aria-label="新会话">
+            +
+          </button>
+        </header>
+
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <form id="composer" class="composer">
+          <textarea id="messageInput" rows="1" autocomplete="off" placeholder="输入消息"></textarea>
+          <button id="sendButton" type="submit">发送</button>
+        </form>
+      </section>
+
+      <aside class="side-pane" aria-label="状态">
+        <header>
+          <h2>状态</h2>
+          <span id="healthBadge">checking</span>
+        </header>
+        <dl>
+          <dt>用户</dt>
+          <dd id="userIdLabel">-</dd>
+          <dt>会话</dt>
+          <dd id="sessionIdLabel">-</dd>
+          <dt>请求</dt>
+          <dd id="requestState">idle</dd>
+        </dl>
+        <section class="reserved">
+          <h3>Trace</h3>
+          <p id="traceText">pending</p>
+        </section>
+      </aside>
+    </main>
+    <script src="/static/app.js?v=20260616" type="module"></script>
+  </body>
+</html>

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from agent.service import AgentService, ChatResult
@@ -48,7 +52,14 @@ def _chat_response(result: ChatResult) -> ChatResponse:
     )
 
 
-def create_app(service: AgentService | None = None) -> FastAPI:
+SessionReader = Callable[[int, int], list[dict[str, Any]]]
+
+
+def create_app(
+    service: AgentService | None = None,
+    *,
+    session_reader: SessionReader | None = None,
+) -> FastAPI:
     """Create the Web API.
 
     A service can be injected by tests or alternate launchers. When omitted,
@@ -73,6 +84,16 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                 await runtime.shutdown()
 
     app = FastAPI(title="Telegram Bot MVP Web API", lifespan=lifespan)
+    static_dir = Path(__file__).with_name("static")
+    if static_dir.exists():
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    @app.get("/", include_in_schema=False)
+    async def index() -> FileResponse:
+        index_path = static_dir / "index.html"
+        if not index_path.exists():
+            raise HTTPException(status_code=404, detail="Web app is not built")
+        return FileResponse(index_path)
 
     @app.get("/api/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -98,9 +119,12 @@ def create_app(service: AgentService | None = None) -> FastAPI:
         session_id: int,
         user_id: int = Query(default=1),
     ) -> MessageListResponse:
-        from persistence.session_store import get_session_store
+        if session_reader is None:
+            from persistence.session_store import get_session_store
 
-        messages = get_session_store().load(user_id, session_id) or []
+            messages = get_session_store().load(user_id, session_id) or []
+        else:
+            messages = session_reader(user_id, session_id)
         return MessageListResponse(
             user_id=user_id,
             session_id=session_id,
