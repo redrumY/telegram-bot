@@ -15,6 +15,8 @@ sqlite-vec = "^0.1"
 pydantic = "^2.0"
 pydantic-settings = "^2.0"
 langsmith = "^0.8.5"
+fastapi = "^0.115"
+uvicorn = {extras = ["standard"], version = "^0.34"}
 
 [build-system]
 requires = ["poetry-core"]
