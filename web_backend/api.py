@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -10,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -111,6 +114,13 @@ def create_app(
     if static_dir.exists():
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+    def read_turn_by_id(turn_id: str) -> Any:
+        if turn_reader is None:
+            from persistence.turn_store import get_turn_store
+
+            return get_turn_store().get_turn(turn_id)
+        return turn_reader(turn_id)
+
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
         index_path = static_dir / "index.html"
@@ -141,15 +151,44 @@ def create_app(
 
     @app.get("/api/turns/{turn_id}", response_model=ChatResponse)
     async def get_turn(turn_id: str) -> ChatResponse:
-        if turn_reader is None:
-            from persistence.turn_store import get_turn_store
-
-            turn = get_turn_store().get_turn(turn_id)
-        else:
-            turn = turn_reader(turn_id)
+        turn = read_turn_by_id(turn_id)
         if turn is None:
             raise HTTPException(status_code=404, detail="Turn not found")
         return _turn_response(turn)
+
+    @app.get("/api/turns/{turn_id}/events")
+    async def turn_events(turn_id: str) -> StreamingResponse:
+        if read_turn_by_id(turn_id) is None:
+            raise HTTPException(status_code=404, detail="Turn not found")
+
+        async def event_stream() -> AsyncIterator[str]:
+            last_payload = ""
+            terminal_statuses = {"done", "failed"}
+            while True:
+                turn = read_turn_by_id(turn_id)
+                if turn is None:
+                    payload = {"turn_id": turn_id, "status": "failed", "error": "Turn not found"}
+                    yield _sse("failed", payload)
+                    return
+                response = _turn_response(turn)
+                payload = response.model_dump()
+                encoded = json.dumps(payload, ensure_ascii=False)
+                if encoded != last_payload:
+                    yield _sse(str(turn.status), payload)
+                    last_payload = encoded
+                if str(turn.status) in terminal_statuses:
+                    return
+                await asyncio.sleep(0.75)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    def _sse(event: str, payload: dict[str, Any]) -> str:
+        data = json.dumps(payload, ensure_ascii=False)
+        return f"event: {event}\ndata: {data}\n\n"
 
     @app.get("/api/sessions/{session_id}/messages", response_model=MessageListResponse)
     async def session_messages(

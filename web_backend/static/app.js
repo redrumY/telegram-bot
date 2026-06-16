@@ -129,6 +129,18 @@ async function waitForTurn(turnId) {
   if (!turnId || turnId === "inline") {
     return;
   }
+  if ("EventSource" in window) {
+    try {
+      await waitForTurnEvents(turnId);
+      return;
+    } catch (error) {
+      nodes.traceText.textContent = "sse fallback";
+    }
+  }
+  await pollTurn(turnId);
+}
+
+async function pollTurn(turnId) {
   for (;;) {
     const response = await fetch(`/api/turns/${turnId}`);
     if (!response.ok) {
@@ -147,6 +159,49 @@ async function waitForTurn(turnId) {
     }
     await new Promise((resolve) => window.setTimeout(resolve, 750));
   }
+}
+
+function waitForTurnEvents(turnId) {
+  return new Promise((resolve, reject) => {
+    const source = new EventSource(`/api/turns/${turnId}/events`);
+    const timeout = window.setTimeout(() => {
+      source.close();
+      reject(new Error("SSE timeout"));
+    }, 120000);
+
+    const handle = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        setBusy(true, data.status || "processing");
+        nodes.traceText.textContent = data.status || "processing";
+        if (data.status === "done") {
+          window.clearTimeout(timeout);
+          source.close();
+          appendMessage("assistant", data.answer || "");
+          nodes.traceText.textContent = "done";
+          resolve();
+        } else if (data.status === "failed") {
+          window.clearTimeout(timeout);
+          source.close();
+          reject(new Error(data.error || "turn failed"));
+        }
+      } catch (error) {
+        window.clearTimeout(timeout);
+        source.close();
+        reject(error);
+      }
+    };
+
+    source.addEventListener("pending", handle);
+    source.addEventListener("processing", handle);
+    source.addEventListener("done", handle);
+    source.addEventListener("failed", handle);
+    source.onerror = () => {
+      window.clearTimeout(timeout);
+      source.close();
+      reject(new Error("SSE disconnected"));
+    };
+  });
 }
 
 nodes.composer.addEventListener("submit", (event) => {
