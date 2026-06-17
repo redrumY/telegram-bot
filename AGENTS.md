@@ -15,6 +15,11 @@
 - 基准 eval 必须跑真实被动回复链: haystack replay → consolidation → invalidation → PassiveTurnPipeline QA
 - 不使用 `--mock`；`eval/runner.py` 只作为 legacy seeded regression，不代表真实链路
 
+## 文档约定
+- 当前阶段进展、验收结果、未完成事项写入 `PROGRESS.md`
+- Docker 启动、停止、日志、部署说明写入 `DOCKER.md`
+- 插件系统、记忆系统、pipeline 规范不要和 Web 后端升级进展混写
+
 ## 关键命令
 ```bash
 # 启动 Bot
