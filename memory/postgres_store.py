@@ -60,12 +60,17 @@ class PostgresMemoryStore:
     ) -> list[MemoryItem]:
         statuses = ["active", "superseded"] if include_superseded else ["active"]
         clauses = ["user_id = %s", "status = ANY(%s)", "embedding IS NOT NULL"]
-        params: list[Any] = [int(user_id), statuses]
+        where_params: list[Any] = [int(user_id), statuses]
         if memory_types:
             clauses.append("memory_type = ANY(%s)")
-            params.append(memory_types)
+            where_params.append(memory_types)
         query_literal = _vector_literal(query_vec)
-        params.extend([query_literal, query_literal, max(1, int(top_k))])
+        params: list[Any] = [
+            query_literal,
+            *where_params,
+            query_literal,
+            max(1, int(top_k)),
+        ]
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
